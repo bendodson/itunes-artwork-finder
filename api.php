@@ -47,7 +47,7 @@ if ($search) {
 		$data = array();
 		$data['url'] = str_replace('100x100', '600x600', $result->artworkUrl100);
 
-		$hires = str_replace('.100x100-75', '', $result->artworkUrl100);
+		$hires = str_replace('100x100bb-85', '2100x2100bb-92', $result->artworkUrl100);
 		$parts = parse_url($hires);
 		$hires = 'http://is5.mzstatic.com'.$parts['path'];
 
@@ -77,10 +77,6 @@ if ($search) {
 				$warning = '(probably won\'t work)';
 				break;
 			case 'album':
-				$hires = str_replace('.100x100-75', '.1500x1500-75', $result->artworkUrl100);
-				$parts = parse_url($hires);
-				$hires = 'http://is5.mzstatic.com'.$parts['path'];
-				$data['hires'] = $hires;
 				$data['title'] = $result->collectionName.' (by '.$result->artistName.')';
 				//$warning = '(probably won\'t work)';
 				break;
