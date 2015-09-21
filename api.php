@@ -47,7 +47,7 @@ if ($search) {
 		$data = array();
 		$data['url'] = str_replace('100x100', '600x600', $result->artworkUrl100);
 
-		$hires = str_replace('100x100bb-85', '2100x2100bb-92', $result->artworkUrl100);
+		$hires = str_replace('100x100bb-85', '100000x100000-999', $result->artworkUrl100);
 		$parts = parse_url($hires);
 		$hires = 'http://is5.mzstatic.com'.$parts['path'];
 
