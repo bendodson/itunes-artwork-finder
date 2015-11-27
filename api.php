@@ -88,7 +88,7 @@ if ($search) {
 				$data['title'] = $result->collectionName.' (by '.$result->artistName.')';
 				break;
 			case 'software':
-				$data['url'] = $result->artworkUrl512;
+				$data['url'] = str_replace('512x512bb', '1024x1024bb', $result->artworkUrl512);
 				$data['appstore'] = $result->trackViewUrl;
 				$data['title'] = $result->trackName;
 				$width = 512;
