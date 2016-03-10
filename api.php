@@ -21,7 +21,7 @@ if ($search) {
 		$url .= '&attribute=shortFilmTerm';
 		$entity = 'shortFilm';
 	}
-	if ($_GET['entity'] == 'id') {
+	if ($_GET['entity'] == 'id' || $_GET['entity'] == 'idAlbum') {
 		$url = 'https://itunes.apple.com/lookup?id='.urlencode($search).'&country='.$_GET['country'];
 	}
 	
@@ -77,6 +77,7 @@ if ($search) {
 				$warning = '(probably won\'t work)';
 				break;
 			case 'album':
+			case 'idAlbum':
 				$data['title'] = $result->collectionName.' (by '.$result->artistName.')';
 				//$warning = '(probably won\'t work)';
 				break;

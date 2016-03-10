@@ -1,7 +1,7 @@
 iTunes Artwork Finder
 =====================
 
-This is the JavaScript and PHP code that powers the iTunes Artwork Finder available at [http://bendodson.com/projects/itunes-artwork-finder/](http://bendodson.com/projects/itunes-artwork-finder/)
+This is the JavaScript and PHP code that powers the iTunes Artwork Finder available at [https://bendodson.com/projects/itunes-artwork-finder/](https://bendodson.com/projects/itunes-artwork-finder/)
 
 To use on your own site, simply upload both the JavaScript and PHP files and then initialise the script with something like:
 
@@ -18,7 +18,8 @@ To use on your own site, simply upload both the JavaScript and PHP files and the
 					<option value="audiobook">Audiobook</option>
 					<option value="podcast">Podcast</option>
 					<option value="musicVideo">Music Video (may not work)</option>
-					<option value="id">Apple ID (Movies)</option>
+					<option value="id">Apple ID (Movie)</option>
+                    <option value="idAlbum">Apple ID (Album)</option>
 					<option value="shortFilm">Short Film</option>
 				</select>
 				<input type="text" class="text" name="query" id="query" />
