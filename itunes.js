@@ -1,3 +1,5 @@
+var pathToAPI = 'https://example/com/api.php'; // replace with your path to the api.php file
+
 var countries = {
     ae: 'United Arab Emirates',
     ag: 'Antigua and Barbuda',
@@ -58,7 +60,7 @@ var countries = {
     hk: 'Hong Kong',
     hn: 'Honduras',
     hr: 'Croatia',
-    hu: 'Hungaria',
+    hu: 'Hungary',
     id: 'Indonesia',
     ie: 'Ireland',
     il: 'Israel',
@@ -186,36 +188,61 @@ function performSearch() {
     $.ajax({
         type: "GET",
         crossDomain: true,
-        url: 'api.php',
-        data: {query: query, entity: entity, country: country},
+        url: 'https://itunesartwork.bendodson.com/api.php',
+        data: {query: query, entity: entity, country: country, type: 'request'},
         dataType: 'json'
     }).done(function(data) {
-        $('#results').html('');
-        if (data.error) {
-                $('#results').append('<h3>'+data.error+'</h3>');
-        } else {
-            if (!data.length) {
-                $('#results').append('<h3>No results found.</h3>');
-            } else {
-                for (var i = 0; i < data.length; i++) {
-                    var result = data[i];
-                    console.log(result.title);
 
-                    var html = '<div><h3>'+result.title+'</h3>';
-                    if (entity != 'software') {
-                        html += '<p><a href="'+result.url+'" target="_blank">Standard Resolution</a> | <a href="'+result.hires+'" target="_blank">High Resolution</a> <em><small>'+result.warning+'</small></em></p>';
+        $.ajax({
+
+            type: "GET",
+            crossDomain: true,
+            url: data.url,
+            data: {},
+            dataType: 'jsonp'
+
+        }).done(function(data) {
+
+            console.log(data);
+
+            $.ajax({
+
+                type: "POST",
+                crossDomain: true,
+                url: pathToAPI,
+                data: {json: JSON.stringify(data), type: 'data', entity: entity},
+                dataType: 'json'
+
+            }).done(function(data) {
+
+                $('#results').html('');
+                if (data.error) {
+                        $('#results').append('<h3>'+data.error+'</h3>');
+                } else {
+                    if (!data.length) {
+                        $('#results').append('<h3>No results found.</h3>');
                     } else {
-                        html += '<p><a href="./app/?url='+encodeURIComponent(result.appstore)+'" target="_blank">View screenshots / videos</a></p>';
-                    }
-                    html += '<a href="'+result.url+'" target="_blank"><img src="'+result.url+'" alt="iTunes Artwork for \''+result.title+'\'" width="'+result.width+'" height="'+result.height+'"></a>';
-                    html += '</div>';
+                        for (var i = 0; i < data.length; i++) {
+                            var result = data[i];
+                            console.log(result.title);
 
-                    $('#results').append(html);
-                };
-            }            
-        }
-        $('#results').append('<p>If the item you are searching for is not available on iTunes, this tool will not find it. Please do not email me asking for specific items if they are not available on iTunes! I recommend both <a href="https://code.google.com/p/subler/">Subler</a> and <a href="https://www.google.co.uk/imghp?gws_rd=ssl">Google Image Search</a> as good alternative places to find artwork.</p>');
+                            var html = '<div><h3>'+result.title+'</h3>';
+                            if (entity != 'software' && entity != 'iPadSoftware' && entity != 'macSoftware') {
+                                html += '<p><a href="'+result.url+'" target="_blank">Standard Resolution</a> | <a href="'+result.hires+'" target="_blank">High Resolution</a> <em><small>'+result.warning+'</small></em></p>';
+                            } else if (entity == 'software' || entity == 'iPadSoftware') {
+                                html += '<p><a href="./app/?url='+encodeURIComponent(result.appstore)+'&country='+country+'" target="_blank">View screenshots / videos</a></p>';
+                            }
+                            html += '<a href="'+result.url+'" target="_blank"><img src="'+result.url+'" alt="iTunes Artwork for \''+result.title+'\'" width="'+result.width+'" height="'+result.height+'"></a>';
+                            html += '</div>';
 
+                            $('#results').append(html);
+                        };
+                    }            
+                }
+                $('#results').append('<p>If the item you are searching for is not available on iTunes, this tool will not find it. Please do not email me asking for specific items if they are not available on iTunes! I recommend both <a href="https://bitbucket.org/galad87/subler/">Subler</a> and <a href="https://www.google.co.uk/imghp?gws_rd=ssl">Google Image Search</a> as good alternative places to find artwork.</p>');
+
+            });
+        });
     });
 }
 
