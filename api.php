@@ -8,7 +8,6 @@ if (isset($_GET['type']) && $_GET['type'] == 'request') {
 		$country = ($_GET['country']) ? $_GET['country'] : 'us';
 		$width = 600;
 		$height = 600;
-		$warning = '';
 
 		$shortFilm = false;
 		if ($entity == 'shortFilm') {
@@ -54,12 +53,19 @@ if (isset($_POST['type']) && $_POST['type'] == 'data') {
 
 		$hires = str_replace('100x100bb', '100000x100000-999', $result->artworkUrl100);
 		$parts = parse_url($hires);
-		$hires = 'http://is5.mzstatic.com'.$parts['path'];
+		$hires = 'https://is5-ssl.mzstatic.com'.$parts['path'];
 
 		$data['hires'] = $hires;
 		$data['title'] = ($entity == 'movie') ? $result->trackName : $result->collectionName;
 
-		$warning = '';
+		if ($_POST['entity'] == 'album' || $_POST['entity'] == 'idAlbum') {
+			$parts = explode('/image/thumb/', $hires);
+			if (count($parts) == 2) {
+				$parts = explode('/', $parts[1]);
+				array_pop($parts);
+				$data['uncompressed'] = 'https://a5.mzstatic.com/us/r1000/0/'.implode('/', $parts);
+			}
+		}
 
 		switch ($entity) {
 			case 'musicVideo':
@@ -79,21 +85,17 @@ if (isset($_POST['type']) && $_POST['type'] == 'data') {
 					$data['title'] = $result->collectionName;
 				}
 				$width = 400;
-				$warning = '(may not work)';
 				break;
 			case 'ebook':
 				$data['title'] = $result->trackName.' (by '.$result->artistName.')';
 				$width = 400;
-				$warning = '(probably won\'t work)';
 				break;
 			case 'album':
 			case 'idAlbum':
 				$data['title'] = $result->collectionName.' (by '.$result->artistName.')';
-				//$warning = '(probably won\'t work)';
 				break;
 			case 'audiobook':
 				$data['title'] = $result->collectionName.' (by '.$result->artistName.')';
-				$warning = '(probably won\'t work)';
 				break;
 			case 'podcast':
 				$data['title'] = $result->collectionName.' (by '.$result->artistName.')';
@@ -114,7 +116,6 @@ if (isset($_POST['type']) && $_POST['type'] == 'data') {
 		if ($data['title']) {
 			$data['width'] = $width;
 			$data['height'] = $height;
-			$data['warning'] = $warning;
 			$output[] = $data;	
 		}
 	}
