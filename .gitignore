@@ -1,0 +1,44 @@
+# Dependencies
+node_modules/
+package-lock.json
+
+# Output directories
+data/output/artwork/*.jpg
+data/output/artwork/*.png
+data/output/artwork/*.jpeg
+data/output/audio/*
+data/output/lyrics/*
+data/output/reports/*.log
+data/output/reports/*.csv
+
+# Keep directory structure
+!data/output/artwork/.gitkeep
+!data/output/audio/.gitkeep
+!data/output/lyrics/.gitkeep
+!data/output/reports/.gitkeep
+
+# User input files (except sample)
+data/input/*.csv
+!data/input/sample.csv
+
+# Config with secrets
+config/production.json
+config/local.json
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo

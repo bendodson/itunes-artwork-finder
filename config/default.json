@@ -1,0 +1,43 @@
+{
+  "artwork": {
+    "providers": {
+      "itunes": {
+        "enabled": true,
+        "rateLimit": 20,
+        "timeout": 10000
+      },
+      "spotify": {
+        "enabled": false,
+        "clientId": "",
+        "clientSecret": "",
+        "rateLimit": 180,
+        "timeout": 10000
+      },
+      "musicbrainz": {
+        "enabled": true,
+        "rateLimit": 1,
+        "timeout": 10000,
+        "userAgent": "MusicRecoveryTool/1.0.0 (contact@example.com)"
+      }
+    },
+    "fileNameFormat": "{artist} - {title}",
+    "maxConcurrent": 5,
+    "retryAttempts": 3,
+    "retryDelay": 2000
+  },
+  "audio": {
+    "enabled": false
+  },
+  "lyrics": {
+    "enabled": false
+  },
+  "csv": {
+    "batchSize": 50,
+    "delimiter": ","
+  },
+  "logging": {
+    "level": "info",
+    "console": true,
+    "file": true
+  }
+}
