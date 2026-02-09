@@ -63,6 +63,8 @@ CLEAN_KEYWORDS = ("clean",)
 MIN_IMAGE_BYTES_DEFAULT = 5 * 1024
 WIDESCREEN_SKIP_BYTES_DEFAULT = 100 * 1024
 OPENAI_IMAGES_EDITS_ENDPOINT = "https://api.openai.com/v1/images/edits"
+OPENAI_GPT_IMAGE_MODELS = ("gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5")
+OPENAI_GPT_IMAGE_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
 
 
 @dataclass
@@ -301,6 +303,121 @@ def _parse_b64_image_from_edits_payload(payload: Dict[str, Any]) -> Optional[byt
     return None
 
 
+def _extract_openai_error_text(response: Response) -> Tuple[str, Optional[Dict[str, Any]]]:
+    payload: Optional[Dict[str, Any]] = None
+    detail = response.text.strip()
+    try:
+        parsed = response.json()
+        if isinstance(parsed, dict):
+            payload = parsed
+            error = parsed.get("error")
+            if isinstance(error, dict):
+                message = str(error.get("message") or "").strip()
+                error_type = str(error.get("type") or "").strip()
+                error_code = str(error.get("code") or "").strip()
+                parts = [part for part in (message, error_type, error_code) if part]
+                if parts:
+                    detail = " | ".join(parts)
+    except ValueError:
+        pass
+
+    if len(detail) > 350:
+        detail = detail[:350]
+    return detail, payload
+
+
+def _is_model_not_supported_error(status_code: int, detail: str, payload: Optional[Dict[str, Any]]) -> bool:
+    if status_code not in {400, 404, 422}:
+        return False
+
+    haystack_parts = [detail]
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            for key in ("message", "type", "code", "param"):
+                value = error.get(key)
+                if isinstance(value, str):
+                    haystack_parts.append(value)
+
+    haystack = " ".join(haystack_parts).lower()
+    return any(
+        token in haystack
+        for token in (
+            "invalid model",
+            "model_not_found",
+            "unsupported model",
+            "does not support",
+            "not available",
+            "unknown model",
+        )
+    )
+
+
+def _is_gpt_image_model(model: str) -> bool:
+    normalized = (model or "").strip().lower()
+    return normalized.startswith("gpt-image-")
+
+
+def _derive_openai_size(target_width: int, target_height: int) -> Optional[str]:
+    size = f"{target_width}x{target_height}"
+    if size in OPENAI_GPT_IMAGE_SIZES:
+        return size
+    return None
+
+
+def _request_openai_image_edit_once(
+    canvas_png: bytes,
+    mask_png: bytes,
+    prompt: str,
+    model: str,
+    seed: Optional[int],
+    timeout_s: int,
+    size: Optional[str],
+    endpoint: str,
+    api_key: str,
+) -> Tuple[Optional[bytes], Optional[str], bool]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+    }
+
+    data: Dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+    }
+    if seed is not None:
+        data["seed"] = str(seed)
+    if size:
+        data["size"] = size
+    if not _is_gpt_image_model(model):
+        data["response_format"] = "b64_json"
+
+    image_field = "image[]" if _is_gpt_image_model(model) else "image"
+    files = [
+        (image_field, ("canvas.png", canvas_png, "image/png")),
+        ("mask", ("mask.png", mask_png, "image/png")),
+    ]
+
+    try:
+        response = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_s)
+    except RequestException as exc:
+        return None, f"image-edit request error: {exc}", False
+
+    if response.status_code != 200:
+        detail, payload = _extract_openai_error_text(response)
+        unsupported_model = _is_model_not_supported_error(response.status_code, detail, payload)
+        return None, f"image-edit HTTP {response.status_code}: {detail}", unsupported_model
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return None, f"invalid JSON from image-edit endpoint: {exc}", False
+
+    image_bytes = _parse_b64_image_from_edits_payload(payload)
+    if not image_bytes:
+        return None, "image-edit response missing b64_json image payload", False
+    return image_bytes, None, False
+
+
 def _request_openai_image_edit(
     canvas_png: bytes,
     mask_png: bytes,
@@ -308,51 +425,49 @@ def _request_openai_image_edit(
     model: str,
     seed: Optional[int],
     timeout_s: int,
-) -> Tuple[Optional[bytes], Optional[str]]:
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
-        return None, "missing OPENAI_API_KEY"
+        return None, "missing OPENAI_API_KEY", None
 
     endpoint = os.environ.get("OPENAI_IMAGES_EDITS_URL", OPENAI_IMAGES_EDITS_ENDPOINT).strip()
     if not endpoint:
         endpoint = OPENAI_IMAGES_EDITS_ENDPOINT
 
-    headers = {
-        "Authorization": f"Bearer {api_key}",
-    }
-    data: Dict[str, Any] = {
-        "model": model,
-        "prompt": prompt,
-        "response_format": "b64_json",
-    }
-    if seed is not None:
-        data["seed"] = str(seed)
+    size = _derive_openai_size(target_width=canvas_png and 0 or 0, target_height=mask_png and 0 or 0)
+    # Use caller-provided dimensions where possible; we only send size for supported values.
+    # Size is optional and intentionally omitted for arbitrary large canvas dimensions.
+    size = None
 
-    files = {
-        "image": ("canvas.png", canvas_png, "image/png"),
-        "mask": ("mask.png", mask_png, "image/png"),
-    }
+    requested_model = (model or "").strip()
+    fallback_model = "dall-e-2"
+    candidate_models = [requested_model]
+    if requested_model and requested_model != fallback_model:
+        candidate_models.append(fallback_model)
 
-    try:
-        response = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_s)
-    except RequestException as exc:
-        return None, f"image-edit request error: {exc}"
+    first_error: Optional[str] = None
+    for idx, candidate_model in enumerate(candidate_models):
+        image_bytes, error_message, unsupported_model = _request_openai_image_edit_once(
+            canvas_png=canvas_png,
+            mask_png=mask_png,
+            prompt=prompt,
+            model=candidate_model,
+            seed=seed,
+            timeout_s=timeout_s,
+            size=size if _is_gpt_image_model(candidate_model) else None,
+            endpoint=endpoint,
+            api_key=api_key,
+        )
+        if image_bytes:
+            return image_bytes, None, candidate_model
 
-    if response.status_code != 200:
-        detail = response.text.strip()
-        if len(detail) > 350:
-            detail = detail[:350]
-        return None, f"image-edit HTTP {response.status_code}: {detail}"
+        if idx == 0:
+            first_error = error_message
+            if unsupported_model and len(candidate_models) > 1:
+                continue
+        return None, error_message, candidate_model
 
-    try:
-        payload = response.json()
-    except ValueError as exc:
-        return None, f"invalid JSON from image-edit endpoint: {exc}"
-
-    image_bytes = _parse_b64_image_from_edits_payload(payload)
-    if not image_bytes:
-        return None, "image-edit response missing b64_json image payload"
-    return image_bytes, None
+    return None, first_error or "image-edit request failed", candidate_models[-1] if candidate_models else None
 
 
 def _profile_prompt_suffix(style_profile: str) -> str:
