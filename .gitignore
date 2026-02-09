@@ -2,6 +2,9 @@
 .venv*
 __pycache__/
 *.pyc
+python/.venv*
+python/__pycache__/
+python/out/
 
 # Generated data / caches
 album_cache_phase*_out/
@@ -11,6 +14,7 @@ album_cache_out/
 
 # Apple Music / personal data
 Library.xml
+python/Library.xml
 
 # OS
 .DS_Store
