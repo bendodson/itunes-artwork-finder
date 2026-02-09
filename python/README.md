@@ -100,6 +100,40 @@ python python/album_cache.py review --mode both --overrides out/overrides.json
 python python/album_cache.py resolve --resume --overrides out/overrides.json
 ```
 
+## Phase 3: Download Source Artwork
+
+Download square source artwork from the already-resolved Apple artwork CDN URLs in
+`album_id_map.json` (no iTunes Search/Lookup calls in this step).
+
+```bash
+python python/album_cache.py download-art \
+  --map-json python/out/album_id_map.json \
+  --out-dir out/source_art \
+  --prefer-size hires \
+  --resume
+```
+
+Defaults for `download-art`:
+- `--map-json out/album_id_map.json`
+- `--out-dir out/source_art`
+- `--prefer-size hires`
+- `--concurrency 2`
+- `--timeout-s 30`
+- `--retries 3`
+- `--sleep-ms 150`
+- `--resume` enabled
+- `--format keep`
+- `--manifest out/source_art/manifest.json`
+
+Outputs:
+- Source artwork files in `out/source_art/`
+- Download manifest in `out/source_art/manifest.json`
+
+Hires behavior:
+- For `--prefer-size hires`, the downloader transforms size tokens like
+  `100x100bb` to `100000x100000-999` (same pattern used by the original
+  `itunes-artwork-finder` project) before downloading from Apple's artwork CDN.
+
 ## Polite API Usage
 
 This pipeline is designed to be resumable and polite:

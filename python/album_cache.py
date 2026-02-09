@@ -3,7 +3,8 @@
 
 Phase 1: Extract a deduped albums manifest from an Apple Music/iTunes Library.xml
 Phase 2: Resolve collection IDs and artwork URLs using iTunes Search API
-Phase 3: Review ambiguous/unresolved rows and create local overrides
+Phase 3: Download source artwork from resolved Apple artwork CDN URLs
+Review: Interactively resolve ambiguous/unresolved rows and create local overrides
 """
 
 from __future__ import annotations
@@ -12,17 +13,29 @@ import argparse
 import csv
 import json
 import plistlib
+import random
 import re
 import sys
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from requests import Response
 from requests.exceptions import RequestException
+
+try:
+    from PIL import Image
+
+    PIL_AVAILABLE = True
+except Exception:
+    Image = None
+    PIL_AVAILABLE = False
 
 SEARCH_ENDPOINT = "https://itunes.apple.com/search"
 LOOKUP_ENDPOINT = "https://itunes.apple.com/lookup"
@@ -39,6 +52,7 @@ ANNIVERSARY_KEYWORDS = ("anniversary",)
 ORIGINAL_AVOID_KEYWORDS = REMASTER_KEYWORDS + ANNIVERSARY_KEYWORDS + ("reissue",)
 EXPLICIT_KEYWORDS = ("explicit",)
 CLEAN_KEYWORDS = ("clean",)
+MIN_IMAGE_BYTES_DEFAULT = 5 * 1024
 
 
 @dataclass
@@ -116,6 +130,10 @@ def _safe_int(value: Any) -> Optional[int]:
         return None
 
 
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def derive_artwork_url(url: str, size: int) -> str:
     if not url:
         return ""
@@ -123,6 +141,257 @@ def derive_artwork_url(url: str, size: int) -> str:
     if replaced == url:
         replaced = re.sub(r"\d+x\d+", f"{size}x{size}", url, count=1)
     return replaced
+
+
+def derive_hires_artwork_url(url: str) -> str:
+    if not url:
+        return ""
+    replaced = re.sub(r"/\d+x\d+bb", "/100000x100000-999", url, count=1)
+    if replaced == url:
+        replaced = re.sub(r"\d+x\d+bb", "100000x100000-999", url, count=1)
+    return replaced
+
+
+def choose_artwork_url(entry: Dict[str, Any], prefer_size: str) -> str:
+    artwork_100 = str(entry.get("artworkUrl100", "") or "")
+    artwork_600 = str(entry.get("artworkUrl600", "") or "")
+    artwork_3000 = str(entry.get("artworkUrl3000", "") or "")
+
+    if prefer_size == "hires":
+        if artwork_100:
+            return derive_hires_artwork_url(artwork_100)
+        if artwork_600 and re.search(r"\d+x\d+bb", artwork_600):
+            return derive_hires_artwork_url(artwork_600)
+        return artwork_3000 or artwork_600 or artwork_100
+
+    if prefer_size == "3000":
+        return artwork_3000 or artwork_600 or artwork_100
+
+    if prefer_size == "600":
+        if artwork_600:
+            return artwork_600
+        if artwork_100:
+            return derive_artwork_url(artwork_100, 600)
+        return artwork_3000 or artwork_100
+
+    return artwork_100 or artwork_600 or artwork_3000
+
+
+def safe_filename(text_key: str, collection_id: Optional[int], limit: int = 120) -> str:
+    normalized = unicodedata.normalize("NFKD", text_key or "").encode("ascii", "ignore").decode("ascii")
+    normalized = normalized.lower().strip()
+    normalized = normalized.replace(" — ", "__").replace(" - ", "__")
+    normalized = re.sub(r"[^a-z0-9_-]+", "-", normalized)
+    normalized = re.sub(r"-{2,}", "-", normalized).strip("-_")
+    if not normalized:
+        normalized = "album"
+    cid = f"cid-{collection_id}" if collection_id is not None else "cid-unknown"
+    max_base = max(16, limit - len(cid) - 2)
+    if len(normalized) > max_base:
+        normalized = normalized[:max_base].rstrip("-_")
+    return f"{normalized}__{cid}"
+
+
+def _extension_from_url(url: str) -> str:
+    suffix = Path(urlparse(url).path).suffix.lower()
+    if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
+        return suffix.lstrip(".")
+    return "jpg"
+
+
+def _extension_from_content_type(content_type: str) -> Optional[str]:
+    value = (content_type or "").split(";", 1)[0].strip().lower()
+    mapping = {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+    }
+    return mapping.get(value)
+
+
+def _valid_existing(path: Path, min_bytes: int) -> bool:
+    return path.exists() and path.is_file() and path.stat().st_size > min_bytes
+
+
+def _find_existing_file(out_dir: Path, stem: str, format_mode: str, chosen_url: str, min_bytes: int) -> Optional[Path]:
+    if format_mode == "jpg":
+        path = out_dir / f"{stem}.jpg"
+        return path if _valid_existing(path, min_bytes) else None
+    if format_mode == "png":
+        path = out_dir / f"{stem}.png"
+        return path if _valid_existing(path, min_bytes) else None
+
+    preferred = out_dir / f"{stem}.{_extension_from_url(chosen_url)}"
+    if _valid_existing(preferred, min_bytes):
+        return preferred
+    for path in sorted(out_dir.glob(f"{stem}.*")):
+        if _valid_existing(path, min_bytes):
+            return path
+    return None
+
+
+def _verify_with_pillow(path: Path) -> Optional[str]:
+    if not PIL_AVAILABLE:
+        return None
+    try:
+        assert Image is not None
+        with Image.open(path) as image:
+            image.verify()
+    except Exception as exc:
+        return f"image verify failed: {exc}"
+    return None
+
+
+def _write_manifest(path: Path, entries: Dict[str, Dict[str, Any]]) -> None:
+    ordered = {key: entries[key] for key in sorted(entries.keys())}
+    payload = {
+        "generatedAt": _utc_now_iso(),
+        "entries": ordered,
+    }
+    write_json_atomic(path, payload)
+
+
+def download_one(
+    text_key: str,
+    record: Dict[str, Any],
+    chosen_url: str,
+    out_dir: Path,
+    format_mode: str,
+    timeout_s: int,
+    retries: int,
+    resume: bool,
+    min_bytes: int,
+) -> Dict[str, Any]:
+    collection_id = _safe_int(record.get("collectionId"))
+    stem = safe_filename(text_key, collection_id)
+    timestamp = _utc_now_iso()
+    if not chosen_url:
+        return {
+            "text_key": text_key,
+            "collectionId": collection_id or "",
+            "chosen_url": chosen_url,
+            "saved_path": "",
+            "bytes": 0,
+            "status": "error",
+            "error_message": "missing artwork URL",
+            "timestamp": timestamp,
+        }
+
+    existing = _find_existing_file(out_dir, stem, format_mode, chosen_url, min_bytes) if resume else None
+    if existing is not None:
+        return {
+            "text_key": text_key,
+            "collectionId": collection_id or "",
+            "chosen_url": chosen_url,
+            "saved_path": str(existing),
+            "bytes": existing.stat().st_size,
+            "status": "skip",
+            "error_message": "",
+            "timestamp": timestamp,
+        }
+
+    last_error = "download failed"
+    max_attempts = max(1, retries + 1)
+    for attempt in range(max_attempts):
+        temp_path: Optional[Path] = None
+        try:
+            response = requests.get(chosen_url, timeout=timeout_s, stream=True)
+            status = response.status_code
+            if status != 200:
+                if status in {408, 429} or status >= 500:
+                    last_error = f"HTTP {status}"
+                    backoff = min(2**attempt, 8) + random.uniform(0, 0.35)
+                    _sleep_seconds(backoff)
+                    continue
+                return {
+                    "text_key": text_key,
+                    "collectionId": collection_id or "",
+                    "chosen_url": chosen_url,
+                    "saved_path": "",
+                    "bytes": 0,
+                    "status": "error",
+                    "error_message": f"HTTP {status}",
+                    "timestamp": _utc_now_iso(),
+                }
+
+            content_type = response.headers.get("Content-Type", "")
+            if not content_type.lower().startswith("image/"):
+                return {
+                    "text_key": text_key,
+                    "collectionId": collection_id or "",
+                    "chosen_url": chosen_url,
+                    "saved_path": "",
+                    "bytes": 0,
+                    "status": "error",
+                    "error_message": f"invalid content-type: {content_type or 'unknown'}",
+                    "timestamp": _utc_now_iso(),
+                }
+
+            extension = (
+                format_mode
+                if format_mode in {"jpg", "png"}
+                else (_extension_from_content_type(content_type) or _extension_from_url(chosen_url))
+            )
+            final_path = out_dir / f"{stem}.{extension}"
+            temp_path = out_dir / f"{final_path.name}.part-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
+
+            bytes_written = 0
+            with temp_path.open("wb") as handle:
+                for chunk in response.iter_content(chunk_size=64 * 1024):
+                    if not chunk:
+                        continue
+                    handle.write(chunk)
+                    bytes_written += len(chunk)
+
+            if bytes_written <= min_bytes:
+                last_error = f"file too small: {bytes_written} bytes"
+                temp_path.unlink(missing_ok=True)
+                backoff = min(2**attempt, 8) + random.uniform(0, 0.35)
+                _sleep_seconds(backoff)
+                continue
+
+            verify_error = _verify_with_pillow(temp_path)
+            if verify_error:
+                last_error = verify_error
+                temp_path.unlink(missing_ok=True)
+                backoff = min(2**attempt, 8) + random.uniform(0, 0.35)
+                _sleep_seconds(backoff)
+                continue
+
+            temp_path.replace(final_path)
+            return {
+                "text_key": text_key,
+                "collectionId": collection_id or "",
+                "chosen_url": chosen_url,
+                "saved_path": str(final_path),
+                "bytes": bytes_written,
+                "status": "ok",
+                "error_message": "",
+                "timestamp": _utc_now_iso(),
+            }
+        except RequestException as exc:
+            last_error = f"request error: {exc}"
+            backoff = min(2**attempt, 8) + random.uniform(0, 0.35)
+            _sleep_seconds(backoff)
+        except OSError as exc:
+            last_error = f"file error: {exc}"
+            backoff = min(2**attempt, 8) + random.uniform(0, 0.35)
+            _sleep_seconds(backoff)
+        finally:
+            if temp_path is not None and temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+
+    return {
+        "text_key": text_key,
+        "collectionId": collection_id or "",
+        "chosen_url": chosen_url,
+        "saved_path": "",
+        "bytes": 0,
+        "status": "error",
+        "error_message": last_error,
+        "timestamp": _utc_now_iso(),
+    }
 
 
 def _parse_retry_after(response: Response) -> Optional[int]:
@@ -1202,6 +1471,100 @@ def review_rows(
     print(f"Wrote: {overrides_path}")
 
 
+def download_artwork(
+    map_json: Path,
+    out_dir: Path,
+    prefer_size: str,
+    concurrency: int,
+    timeout_s: int,
+    retries: int,
+    sleep_ms: int,
+    resume: bool,
+    format_mode: str,
+    manifest_path: Path,
+    min_bytes: int,
+) -> None:
+    ensure_out_dir(out_dir)
+    ensure_out_dir(manifest_path.parent)
+
+    album_map = load_album_map(map_json)
+    entries: Dict[str, Dict[str, Any]] = {}
+    if manifest_path.exists():
+        existing_manifest = load_json_dict(manifest_path)
+        manifest_entries = existing_manifest.get("entries")
+        if isinstance(manifest_entries, dict):
+            for key, value in manifest_entries.items():
+                if isinstance(key, str) and isinstance(value, dict):
+                    entries[key] = value
+
+    jobs: List[Tuple[str, Dict[str, Any], str]] = []
+    for text_key in sorted(album_map.keys()):
+        record = album_map[text_key]
+        jobs.append((text_key, record, choose_artwork_url(record, prefer_size)))
+
+    total = len(jobs)
+    if total == 0:
+        _write_manifest(manifest_path, entries)
+        print(f"No albums found in map: {map_json}")
+        print(f"Wrote: {manifest_path}")
+        return
+
+    ok_count = 0
+    skip_count = 0
+    err_count = 0
+    completed = 0
+
+    def _worker(job: Tuple[str, Dict[str, Any], str]) -> Dict[str, Any]:
+        text_key, record, chosen_url = job
+        try:
+            return download_one(
+                text_key=text_key,
+                record=record,
+                chosen_url=chosen_url,
+                out_dir=out_dir,
+                format_mode=format_mode,
+                timeout_s=timeout_s,
+                retries=retries,
+                resume=resume,
+                min_bytes=min_bytes,
+            )
+        except Exception as exc:
+            return {
+                "text_key": text_key,
+                "collectionId": _safe_int(record.get("collectionId")) or "",
+                "chosen_url": chosen_url,
+                "saved_path": "",
+                "bytes": 0,
+                "status": "error",
+                "error_message": f"unexpected error: {exc}",
+                "timestamp": _utc_now_iso(),
+            }
+
+    with ThreadPoolExecutor(max_workers=max(1, concurrency)) as executor:
+        for result in executor.map(_worker, jobs):
+            text_key = str(result.get("text_key", ""))
+            entries[text_key] = result
+            _write_manifest(manifest_path, entries)
+
+            status = result.get("status")
+            if status == "ok":
+                ok_count += 1
+            elif status == "skip":
+                skip_count += 1
+            else:
+                err_count += 1
+
+            completed += 1
+            print(f"Downloaded {completed}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
+
+            if completed < total and sleep_ms > 0:
+                base = sleep_ms / 1000.0
+                jitter = random.uniform(0, base * 0.5)
+                _sleep_seconds(base + jitter)
+
+    print(f"Wrote: {manifest_path}")
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Album cache pipeline")
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -1322,6 +1685,57 @@ def build_parser() -> argparse.ArgumentParser:
         help="Rows to review",
     )
 
+    download_parser = subparsers.add_parser(
+        "download-art",
+        help="Download source album art into a resumable local cache",
+    )
+    download_parser.add_argument(
+        "--map-json",
+        type=Path,
+        default=Path("out/album_id_map.json"),
+        help="Resolved album map JSON",
+    )
+    download_parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("out/source_art"),
+        help="Output directory for downloaded artwork",
+    )
+    download_parser.add_argument(
+        "--prefer-size",
+        choices=("hires", "3000", "600", "100"),
+        default="hires",
+        help="Preferred source URL size strategy",
+    )
+    download_parser.add_argument("--concurrency", type=int, default=2, help="Concurrent downloads")
+    download_parser.add_argument("--timeout-s", type=int, default=30, help="Per-request timeout in seconds")
+    download_parser.add_argument("--retries", type=int, default=3, help="Retries for transient failures")
+    download_parser.add_argument("--sleep-ms", type=int, default=150, help="Sleep+jitter between completions")
+    download_parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip existing non-empty files (default true)",
+    )
+    download_parser.add_argument(
+        "--format",
+        choices=("jpg", "png", "keep"),
+        default="keep",
+        help="Output extension mode",
+    )
+    download_parser.add_argument(
+        "--manifest",
+        type=Path,
+        default=Path("out/source_art/manifest.json"),
+        help="Manifest output path",
+    )
+    download_parser.add_argument(
+        "--min-bytes",
+        type=int,
+        default=MIN_IMAGE_BYTES_DEFAULT,
+        help="Minimum bytes required for a valid download",
+    )
+
     return parser
 
 
@@ -1371,6 +1785,22 @@ def main() -> None:
             )
         except KeyboardInterrupt:
             print("\nReview interrupted.", file=sys.stderr)
+        return
+
+    if args.command == "download-art":
+        download_artwork(
+            map_json=args.map_json,
+            out_dir=args.out_dir,
+            prefer_size=args.prefer_size,
+            concurrency=args.concurrency,
+            timeout_s=args.timeout_s,
+            retries=args.retries,
+            sleep_ms=args.sleep_ms,
+            resume=args.resume,
+            format_mode=args.format,
+            manifest_path=args.manifest,
+            min_bytes=args.min_bytes,
+        )
         return
 
 

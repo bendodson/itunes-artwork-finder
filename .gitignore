@@ -8,6 +8,12 @@ python/out/
 out/
 out/overrides.json
 python/out/overrides.json
+out/source_art/
+python/out/source_art/
+out/source_art/manifest.json
+python/out/source_art/manifest.json
+*.part
+*.part-*
 
 # Generated data / caches
 album_cache_phase*_out/
