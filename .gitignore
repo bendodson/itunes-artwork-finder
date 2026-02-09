@@ -1,0 +1,16 @@
+# Python
+.venv*
+__pycache__/
+*.pyc
+
+# Generated data / caches
+album_cache_phase*_out/
+album_cache_out/
+*.csv
+*.json
+
+# Apple Music / personal data
+Library.xml
+
+# OS
+.DS_Store
