@@ -4,14 +4,18 @@
 Phase 1: Extract a deduped albums manifest from an Apple Music/iTunes Library.xml
 Phase 2: Resolve collection IDs and artwork URLs using iTunes Search API
 Phase 3: Download source artwork from resolved Apple artwork CDN URLs
+Phase 4: Generate widescreen Frame TV artwork with a protected centered album square
 Review: Interactively resolve ambiguous/unresolved rows and create local overrides
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import csv
+import io
 import json
+import os
 import plistlib
 import random
 import re
@@ -31,10 +35,14 @@ from requests.exceptions import RequestException
 
 try:
     from PIL import Image
+    from PIL import ImageChops
+    from PIL import ImageDraw
 
     PIL_AVAILABLE = True
 except Exception:
     Image = None
+    ImageChops = None
+    ImageDraw = None
     PIL_AVAILABLE = False
 
 SEARCH_ENDPOINT = "https://itunes.apple.com/search"
@@ -53,6 +61,8 @@ ORIGINAL_AVOID_KEYWORDS = REMASTER_KEYWORDS + ANNIVERSARY_KEYWORDS + ("reissue",
 EXPLICIT_KEYWORDS = ("explicit",)
 CLEAN_KEYWORDS = ("clean",)
 MIN_IMAGE_BYTES_DEFAULT = 5 * 1024
+WIDESCREEN_SKIP_BYTES_DEFAULT = 100 * 1024
+OPENAI_IMAGES_EDITS_ENDPOINT = "https://api.openai.com/v1/images/edits"
 
 
 @dataclass
@@ -250,6 +260,423 @@ def _write_manifest(path: Path, entries: Dict[str, Dict[str, Any]]) -> None:
         "entries": ordered,
     }
     write_json_atomic(path, payload)
+
+
+def _resample_lanczos() -> Any:
+    assert Image is not None
+    if hasattr(Image, "Resampling"):
+        return Image.Resampling.LANCZOS
+    return Image.LANCZOS
+
+
+def _draw_debug_crosshair(image: Any) -> None:
+    assert ImageDraw is not None
+    draw = ImageDraw.Draw(image)
+    cx = image.width // 2
+    cy = image.height // 2
+    radius = 28
+    draw.line((cx - radius, cy, cx + radius, cy), fill=(255, 0, 0), width=2)
+    draw.line((cx, cy - radius, cx, cy + radius), fill=(255, 0, 0), width=2)
+
+
+def _image_to_png_bytes(image: Any) -> bytes:
+    buffer = io.BytesIO()
+    image.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
+def _parse_b64_image_from_edits_payload(payload: Dict[str, Any]) -> Optional[bytes]:
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+    first = data[0]
+    if not isinstance(first, dict):
+        return None
+    b64_data = first.get("b64_json")
+    if isinstance(b64_data, str) and b64_data:
+        try:
+            return base64.b64decode(b64_data)
+        except Exception:
+            return None
+    return None
+
+
+def _request_openai_image_edit(
+    canvas_png: bytes,
+    mask_png: bytes,
+    prompt: str,
+    model: str,
+    seed: Optional[int],
+    timeout_s: int,
+) -> Tuple[Optional[bytes], Optional[str]]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None, "missing OPENAI_API_KEY"
+
+    endpoint = os.environ.get("OPENAI_IMAGES_EDITS_URL", OPENAI_IMAGES_EDITS_ENDPOINT).strip()
+    if not endpoint:
+        endpoint = OPENAI_IMAGES_EDITS_ENDPOINT
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+    }
+    data: Dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+        "response_format": "b64_json",
+    }
+    if seed is not None:
+        data["seed"] = str(seed)
+
+    files = {
+        "image": ("canvas.png", canvas_png, "image/png"),
+        "mask": ("mask.png", mask_png, "image/png"),
+    }
+
+    try:
+        response = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_s)
+    except RequestException as exc:
+        return None, f"image-edit request error: {exc}"
+
+    if response.status_code != 200:
+        detail = response.text.strip()
+        if len(detail) > 350:
+            detail = detail[:350]
+        return None, f"image-edit HTTP {response.status_code}: {detail}"
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return None, f"invalid JSON from image-edit endpoint: {exc}"
+
+    image_bytes = _parse_b64_image_from_edits_payload(payload)
+    if not image_bytes:
+        return None, "image-edit response missing b64_json image payload"
+    return image_bytes, None
+
+
+def _profile_prompt_suffix(style_profile: str) -> str:
+    if style_profile == "ambient":
+        return "Use soft atmospheric gradients, subtle bloom, and cinematic depth with gentle transitions."
+    if style_profile == "minimal":
+        return "Use restrained shapes, sparse composition, and clean tonal transitions with minimal detail."
+    if style_profile == "painterly":
+        return "Use painterly textures, visible brush-like surfaces, organic light falloff, and layered depth."
+    return "Use balanced realism with subtle texture, natural gradients, and depth that feels calm and neutral."
+
+
+def _build_widescreen_prompt(style_profile: str) -> str:
+    suffix = _profile_prompt_suffix(style_profile)
+    return (
+        "Create a widescreen background environment that complements the central album artwork without touching it. "
+        "The album artwork is fixed and must remain unchanged. "
+        "Do not alter, redraw, crop, or paint over the central album artwork. "
+        "Generate imagery only in the surrounding background. "
+        "Extend atmosphere, texture, color, and depth outward from the album into the surrounding space. "
+        "No text, no frames, no borders, no UI elements. "
+        f"{suffix}"
+    )
+
+
+def _make_canvas_and_mask(
+    source_path: Path,
+    target_width: int,
+    target_height: int,
+    album_px: int,
+) -> Tuple[Any, Any, Dict[str, int]]:
+    assert PIL_AVAILABLE and Image is not None
+
+    with Image.open(source_path) as source_image:
+        album_image = source_image.convert("RGB")
+
+    resized = album_image.copy()
+    resized.thumbnail((album_px, album_px), _resample_lanczos())
+
+    x0 = (target_width - album_px) // 2
+    y0 = (target_height - album_px) // 2
+    slot_x = (album_px - resized.width) // 2
+    slot_y = (album_px - resized.height) // 2
+
+    canvas = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+    album_slot = Image.new("RGB", (album_px, album_px), (0, 0, 0))
+    album_slot.paste(resized, (slot_x, slot_y))
+    canvas.paste(album_slot, (x0, y0))
+
+    mask = Image.new("L", (target_width, target_height), 255)
+    mask.paste(0, (x0, y0, x0 + album_px, y0 + album_px))
+
+    geometry = {
+        "target_width": target_width,
+        "target_height": target_height,
+        "album_px": album_px,
+        "x0": x0,
+        "y0": y0,
+        "slot_x": slot_x,
+        "slot_y": slot_y,
+        "resized_width": resized.width,
+        "resized_height": resized.height,
+    }
+    return canvas, mask, geometry
+
+
+def _pixel_identical_region(lhs: Any, rhs: Any, x: int, y: int, w: int, h: int) -> bool:
+    assert ImageChops is not None
+    left = lhs.crop((x, y, x + w, y + h))
+    right = rhs.crop((x, y, x + w, y + h))
+    diff = ImageChops.difference(left, right)
+    return diff.getbbox() is None
+
+
+def _find_source_art_path(
+    source_art_dir: Path,
+    source_manifest_entries: Dict[str, Dict[str, Any]],
+    text_key: str,
+    collection_id: Optional[int],
+) -> Optional[Path]:
+    manifest_entry = source_manifest_entries.get(text_key, {})
+    if isinstance(manifest_entry, dict):
+        saved_path = manifest_entry.get("saved_path")
+        if isinstance(saved_path, str) and saved_path:
+            path = Path(saved_path)
+            if path.exists() and path.is_file():
+                return path
+
+    stem = safe_filename(text_key, collection_id)
+    for candidate in sorted(source_art_dir.glob(f"{stem}.*")):
+        if candidate.exists() and candidate.is_file():
+            return candidate
+    return None
+
+
+def generate_widescreen_artwork(
+    source_art_dir: Path,
+    out_dir: Path,
+    map_json: Path,
+    target_width: int,
+    target_height: int,
+    album_px: int,
+    model: str,
+    style_profile: str,
+    resume: bool,
+    sleep_ms: int,
+    seed: Optional[int],
+    debug_save_canvas: bool,
+    limit: Optional[int],
+) -> None:
+    if not PIL_AVAILABLE or Image is None or ImageChops is None or ImageDraw is None:
+        raise RuntimeError("Pillow is required for generate-widescreen. Install: pip install pillow")
+
+    if target_width <= 0 or target_height <= 0 or album_px <= 0:
+        raise ValueError("target-width, target-height, and album-px must be positive integers")
+    if album_px > target_width or album_px > target_height:
+        raise ValueError("album-px must be <= target dimensions")
+    if limit is not None and limit < 0:
+        raise ValueError("limit must be >= 0")
+
+    ensure_out_dir(out_dir)
+
+    manifest_path = out_dir / "manifest.json"
+    entries: Dict[str, Dict[str, Any]] = {}
+    if manifest_path.exists():
+        existing_manifest = load_json_dict(manifest_path)
+        existing_entries = existing_manifest.get("entries")
+        if isinstance(existing_entries, dict):
+            for key, value in existing_entries.items():
+                if isinstance(key, str) and isinstance(value, dict):
+                    entries[key] = value
+
+    source_manifest_entries: Dict[str, Dict[str, Any]] = {}
+    source_manifest_path = source_art_dir / "manifest.json"
+    if source_manifest_path.exists():
+        source_manifest = load_json_dict(source_manifest_path)
+        source_entries = source_manifest.get("entries")
+        if isinstance(source_entries, dict):
+            for key, value in source_entries.items():
+                if isinstance(key, str) and isinstance(value, dict):
+                    source_manifest_entries[key] = value
+
+    album_map = load_album_map(map_json)
+    text_keys = sorted(album_map.keys())
+    total = len(text_keys)
+
+    if total == 0:
+        _write_manifest(manifest_path, entries)
+        print(f"No albums found in map: {map_json}")
+        print(f"Wrote: {manifest_path}")
+        return
+
+    ok_count = 0
+    skip_count = 0
+    err_count = 0
+    generated_new_count = 0
+
+    for index, text_key in enumerate(text_keys, start=1):
+        if limit is not None and generated_new_count >= limit:
+            print(f"Reached --limit={limit}; stopping run.")
+            break
+
+        record = album_map.get(text_key, {})
+        collection_id = _safe_int(record.get("collectionId"))
+        output_path = out_dir / f"{text_key}__{target_width}x{target_height}.png"
+
+        if resume and output_path.exists() and output_path.is_file() and output_path.stat().st_size > WIDESCREEN_SKIP_BYTES_DEFAULT:
+            existing_entry = {
+                "text_key": text_key,
+                "collectionId": collection_id or "",
+                "source_path": entries.get(text_key, {}).get("source_path", ""),
+                "output_path": str(output_path),
+                "bytes": output_path.stat().st_size,
+                "status": "skip",
+                "error_message": "",
+                "timestamp": _utc_now_iso(),
+                "model": model,
+                "style_profile": style_profile,
+                "geometry": {
+                    "target_width": target_width,
+                    "target_height": target_height,
+                    "album_px": album_px,
+                    "x0": (target_width - album_px) // 2,
+                    "y0": (target_height - album_px) // 2,
+                },
+            }
+            entries[text_key] = existing_entry
+            _write_manifest(manifest_path, entries)
+            skip_count += 1
+            print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
+            if index < total and sleep_ms > 0:
+                _sleep_seconds(sleep_ms / 1000.0)
+            continue
+
+        source_path = _find_source_art_path(source_art_dir, source_manifest_entries, text_key, collection_id)
+        if source_path is None:
+            entries[text_key] = {
+                "text_key": text_key,
+                "collectionId": collection_id or "",
+                "source_path": "",
+                "output_path": str(output_path),
+                "bytes": 0,
+                "status": "error",
+                "error_message": "source artwork not found",
+                "timestamp": _utc_now_iso(),
+                "model": model,
+                "style_profile": style_profile,
+            }
+            _write_manifest(manifest_path, entries)
+            err_count += 1
+            print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
+            if index < total and sleep_ms > 0:
+                _sleep_seconds(sleep_ms / 1000.0)
+            continue
+
+        temp_path = out_dir / f".{output_path.name}.part-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
+        try:
+            canvas, mask, geometry = _make_canvas_and_mask(
+                source_path=source_path,
+                target_width=target_width,
+                target_height=target_height,
+                album_px=album_px,
+            )
+            prompt = _build_widescreen_prompt(style_profile)
+
+            if debug_save_canvas:
+                debug_canvas = canvas.copy()
+                _draw_debug_crosshair(debug_canvas)
+                debug_canvas.save(out_dir / f"{text_key}__debug_canvas.png", format="PNG")
+                mask.save(out_dir / f"{text_key}__debug_mask.png", format="PNG")
+
+            expected_album_patch = canvas.crop(
+                (
+                    geometry["x0"],
+                    geometry["y0"],
+                    geometry["x0"] + geometry["album_px"],
+                    geometry["y0"] + geometry["album_px"],
+                )
+            )
+
+            generated_bytes, api_error = _request_openai_image_edit(
+                canvas_png=_image_to_png_bytes(canvas),
+                mask_png=_image_to_png_bytes(mask),
+                prompt=prompt,
+                model=model,
+                seed=seed,
+                timeout_s=180,
+            )
+            if api_error or not generated_bytes:
+                raise RuntimeError(api_error or "image-edit returned empty output")
+
+            generated = Image.open(io.BytesIO(generated_bytes)).convert("RGB")
+            if generated.size != (target_width, target_height):
+                raise RuntimeError(
+                    f"invalid output size {generated.width}x{generated.height}; expected {target_width}x{target_height}"
+                )
+
+            # Enforce strict album pixel identity regardless of model behavior.
+            generated.paste(expected_album_patch, (geometry["x0"], geometry["y0"]))
+
+            if not _pixel_identical_region(
+                generated,
+                canvas,
+                geometry["x0"],
+                geometry["y0"],
+                geometry["album_px"],
+                geometry["album_px"],
+            ):
+                raise RuntimeError("album artwork region changed after generation")
+
+            generated.save(temp_path, format="PNG")
+            temp_path.replace(output_path)
+
+            if output_path.stat().st_size <= MIN_IMAGE_BYTES_DEFAULT:
+                raise RuntimeError(f"generated file too small: {output_path.stat().st_size} bytes")
+
+            # Final validation: exact expected dimensions.
+            with Image.open(output_path) as final_image:
+                if final_image.size != (target_width, target_height):
+                    raise RuntimeError(
+                        f"saved file has invalid size {final_image.width}x{final_image.height}; "
+                        f"expected {target_width}x{target_height}"
+                    )
+
+            entries[text_key] = {
+                "text_key": text_key,
+                "collectionId": collection_id or "",
+                "source_path": str(source_path),
+                "output_path": str(output_path),
+                "bytes": output_path.stat().st_size,
+                "status": "ok",
+                "error_message": "",
+                "timestamp": _utc_now_iso(),
+                "model": model,
+                "style_profile": style_profile,
+                "geometry": geometry,
+            }
+            ok_count += 1
+            generated_new_count += 1
+        except Exception as exc:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            entries[text_key] = {
+                "text_key": text_key,
+                "collectionId": collection_id or "",
+                "source_path": str(source_path),
+                "output_path": str(output_path),
+                "bytes": 0,
+                "status": "error",
+                "error_message": str(exc),
+                "timestamp": _utc_now_iso(),
+                "model": model,
+                "style_profile": style_profile,
+            }
+            err_count += 1
+        finally:
+            if temp_path.exists():
+                temp_path.unlink(missing_ok=True)
+            _write_manifest(manifest_path, entries)
+            print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
+            if index < total and sleep_ms > 0:
+                _sleep_seconds(sleep_ms / 1000.0)
+
+    print(f"Wrote: {manifest_path}")
 
 
 def download_one(
@@ -1736,6 +2163,58 @@ def build_parser() -> argparse.ArgumentParser:
         help="Minimum bytes required for a valid download",
     )
 
+    widescreen_parser = subparsers.add_parser(
+        "generate-widescreen",
+        help="Generate 16:9 Frame TV artwork from square source art",
+    )
+    widescreen_parser.add_argument(
+        "--source-art-dir",
+        type=Path,
+        default=Path("out/source_art"),
+        help="Directory with downloaded square source artwork",
+    )
+    widescreen_parser.add_argument(
+        "--out-dir",
+        type=Path,
+        default=Path("out/widescreen"),
+        help="Output directory for widescreen PNGs + manifest",
+    )
+    widescreen_parser.add_argument(
+        "--map-json",
+        type=Path,
+        default=Path("out/album_id_map.json"),
+        help="Resolved album map JSON",
+    )
+    widescreen_parser.add_argument("--target-width", type=int, default=3840, help="Output width in pixels")
+    widescreen_parser.add_argument("--target-height", type=int, default=2160, help="Output height in pixels")
+    widescreen_parser.add_argument("--album-px", type=int, default=1536, help="Centered album square size in pixels")
+    widescreen_parser.add_argument("--model", required=True, help="Image generation model name")
+    widescreen_parser.add_argument(
+        "--style-profile",
+        choices=("neutral", "ambient", "minimal", "painterly"),
+        default="neutral",
+        help="Background style profile",
+    )
+    widescreen_parser.add_argument(
+        "--resume",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Skip existing outputs larger than 100KB (default true)",
+    )
+    widescreen_parser.add_argument("--sleep-ms", type=int, default=2500, help="Sleep between generations (ms)")
+    widescreen_parser.add_argument("--seed", type=int, default=None, help="Optional deterministic seed")
+    widescreen_parser.add_argument(
+        "--limit",
+        type=int,
+        default=None,
+        help="Optional max number of newly generated images in this run",
+    )
+    widescreen_parser.add_argument(
+        "--debug-save-canvas",
+        action="store_true",
+        help="Save debug canvas + mask with a center crosshair",
+    )
+
     return parser
 
 
@@ -1800,6 +2279,24 @@ def main() -> None:
             format_mode=args.format,
             manifest_path=args.manifest,
             min_bytes=args.min_bytes,
+        )
+        return
+
+    if args.command == "generate-widescreen":
+        generate_widescreen_artwork(
+            source_art_dir=args.source_art_dir,
+            out_dir=args.out_dir,
+            map_json=args.map_json,
+            target_width=args.target_width,
+            target_height=args.target_height,
+            album_px=args.album_px,
+            model=args.model,
+            style_profile=args.style_profile,
+            resume=args.resume,
+            sleep_ms=args.sleep_ms,
+            seed=args.seed,
+            debug_save_canvas=args.debug_save_canvas,
+            limit=args.limit,
         )
         return
 

@@ -134,6 +134,48 @@ Hires behavior:
   `100x100bb` to `100000x100000-999` (same pattern used by the original
   `itunes-artwork-finder` project) before downloading from Apple's artwork CDN.
 
+## Phase 4: Generate Widescreen Frame TV Artwork (16:9)
+
+Generate 3840x2160 widescreen PNGs by placing each source square album image on a
+centered 1536x1536 region, then running image edits only on the surrounding area.
+
+```bash
+python python/album_cache.py generate-widescreen \
+  --source-art-dir out/source_art \
+  --out-dir out/widescreen \
+  --map-json out/album_id_map.json \
+  --target-width 3840 \
+  --target-height 2160 \
+  --album-px 1536 \
+  --model gpt-image-1 \
+  --style-profile neutral \
+  --resume \
+  --sleep-ms 2500
+```
+
+Defaults for `generate-widescreen`:
+- `--source-art-dir out/source_art`
+- `--out-dir out/widescreen`
+- `--map-json out/album_id_map.json`
+- `--target-width 3840`
+- `--target-height 2160`
+- `--album-px 1536`
+- `--style-profile neutral`
+- `--resume` enabled (skip if existing output > 100KB)
+- `--sleep-ms 2500`
+
+Other flags:
+- `--seed` (optional)
+- `--debug-save-canvas` (saves debug canvas/mask per album)
+
+Environment:
+- Set `OPENAI_API_KEY` before running.
+- Optional endpoint override: `OPENAI_IMAGES_EDITS_URL`.
+
+Outputs:
+- Widescreen files in `out/widescreen/` named `<text_key>__3840x2160.png`
+- Run manifest in `out/widescreen/manifest.json`
+
 ## Polite API Usage
 
 This pipeline is designed to be resumable and polite:
