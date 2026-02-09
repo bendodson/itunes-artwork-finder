@@ -5,6 +5,9 @@ __pycache__/
 python/.venv*
 python/__pycache__/
 python/out/
+out/
+out/overrides.json
+python/out/overrides.json
 
 # Generated data / caches
 album_cache_phase*_out/
