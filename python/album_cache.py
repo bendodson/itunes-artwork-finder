@@ -68,6 +68,7 @@ EXPLICIT_KEYWORDS = ("explicit",)
 CLEAN_KEYWORDS = ("clean",)
 MIN_IMAGE_BYTES_DEFAULT = 5 * 1024
 WIDESCREEN_SKIP_BYTES_DEFAULT = 100 * 1024
+JPEG_MAX_BYTES_DEFAULT = 4 * 1024 * 1024
 OPENAI_IMAGES_EDITS_ENDPOINT = "https://api.openai.com/v1/images/edits"
 OPENAI_GPT_IMAGE_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
 EDIT_WIDTH_DEFAULT = 1536
@@ -338,6 +339,7 @@ def _write_widescreen_manifest_and_index(
         index[collection_key] = {
             "text_key": text_key,
             "output_path": entry.get("output_path", ""),
+            "compressed_output_path": entry.get("compressed_output_path", ""),
             "status": entry.get("status", ""),
             "prompt_variant": entry.get("prompt_variant", ""),
             "request_id": entry.get("request_id", ""),
@@ -827,6 +829,60 @@ def _legacy_widescreen_background_output_name(text_key: str, width: int, height:
     return f"{text_key}__{width}x{height}__background.png"
 
 
+def _widescreen_compressed_output_name(content_id: Optional[int], text_key: str, width: int, height: int) -> str:
+    return f"{_widescreen_output_stem(content_id, text_key)}__{width}x{height}.jpg"
+
+
+def _compress_png_to_jpeg_max_bytes(
+    input_path: Path,
+    output_path: Path,
+    max_bytes: int,
+) -> Tuple[bool, int]:
+    assert PIL_AVAILABLE and Image is not None
+    if max_bytes <= 0:
+        raise ValueError("max_bytes must be positive")
+
+    with Image.open(input_path) as img:
+        work = img.convert("RGB")
+
+    ensure_out_dir(output_path.parent)
+    temp_path = output_path.with_suffix(".jpg.part")
+
+    def _save_quality(image: Any, quality: int) -> int:
+        image.save(
+            temp_path,
+            format="JPEG",
+            quality=quality,
+            optimize=True,
+            progressive=True,
+        )
+        return temp_path.stat().st_size
+
+    selected_size = 0
+    selected_ok = False
+    for quality in (92, 88, 84, 80, 76, 72, 68, 64, 60, 56, 52, 48, 44, 40, 36, 32, 28, 24):
+        size = _save_quality(work, quality)
+        selected_size = size
+        if size <= max_bytes:
+            selected_ok = True
+            break
+
+    if not selected_ok:
+        resized = work
+        for scale in (0.95, 0.9, 0.85, 0.8):
+            new_w = max(1, int(work.width * scale))
+            new_h = max(1, int(work.height * scale))
+            resized = work.resize((new_w, new_h), _resample_lanczos())
+            size = _save_quality(resized, 40)
+            selected_size = size
+            if size <= max_bytes:
+                selected_ok = True
+                break
+
+    temp_path.replace(output_path)
+    return selected_ok, selected_size
+
+
 def _composite_album_with_shadow(
     background_rgb: Any,
     album_patch_rgb: Any,
@@ -886,6 +942,8 @@ def _find_source_art_path(
 def generate_widescreen_artwork(
     source_art_dir: Path,
     out_dir: Path,
+    background_dir: Optional[Path],
+    compressed_dir: Optional[Path],
     map_json: Path,
     target_width: int,
     target_height: int,
@@ -903,6 +961,7 @@ def generate_widescreen_artwork(
     album_shadow: bool,
     multipart_mode: str,
     background_mode: str,
+    compressed_max_bytes: int,
 ) -> None:
     if not PIL_AVAILABLE or Image is None or ImageChops is None or ImageDraw is None:
         raise RuntimeError("Pillow is required for generate-widescreen. Install: pip install pillow")
@@ -915,6 +974,10 @@ def generate_widescreen_artwork(
         raise ValueError("limit must be >= 0")
 
     ensure_out_dir(out_dir)
+    resolved_background_dir = background_dir if background_dir is not None else (out_dir.parent / "background")
+    resolved_compressed_dir = compressed_dir if compressed_dir is not None else (out_dir.parent / "widescreen-compressed")
+    ensure_out_dir(resolved_background_dir)
+    ensure_out_dir(resolved_compressed_dir)
     final_w = FRAME_FINAL_WIDTH
     final_h = FRAME_FINAL_HEIGHT
     edit_w = HA_EDIT_WIDTH
@@ -1025,7 +1088,12 @@ def generate_widescreen_artwork(
         record = album_map.get(text_key, {})
         content_id = _resolve_widescreen_content_id(record)
         output_path = out_dir / _widescreen_output_name(content_id, text_key, target_width, target_height)
-        background_output_path = out_dir / _widescreen_background_output_name(content_id, text_key, target_width, target_height)
+        background_output_path = resolved_background_dir / _widescreen_background_output_name(
+            content_id, text_key, target_width, target_height
+        )
+        compressed_output_path = resolved_compressed_dir / _widescreen_compressed_output_name(
+            content_id, text_key, target_width, target_height
+        )
         legacy_output_path = out_dir / _legacy_widescreen_output_name(text_key, target_width, target_height)
         legacy_background_output_path = out_dir / _legacy_widescreen_background_output_name(text_key, target_width, target_height)
 
@@ -1052,7 +1120,11 @@ def generate_widescreen_artwork(
         existing_background_path: Optional[Path] = None
         if existing_output_path is not None:
             if save_background_layer:
-                background_candidates: List[Path] = [background_output_path, legacy_background_output_path]
+                background_candidates: List[Path] = [
+                    background_output_path,
+                    out_dir / _widescreen_background_output_name(content_id, text_key, target_width, target_height),
+                    legacy_background_output_path,
+                ]
                 prior_background = entries.get(text_key, {}).get("background_output_path")
                 if isinstance(prior_background, str) and prior_background.strip():
                     background_candidates.append(Path(prior_background))
@@ -1106,6 +1178,15 @@ def generate_widescreen_artwork(
             if background_ref and background_ref.exists():
                 existing_entry["background_output_path"] = str(background_ref)
                 existing_entry["background_bytes"] = background_ref.stat().st_size
+            compressed_ok, compressed_size = _compress_png_to_jpeg_max_bytes(
+                existing_output_path,
+                compressed_output_path,
+                compressed_max_bytes,
+            )
+            existing_entry["compressed_output_path"] = str(compressed_output_path)
+            existing_entry["compressed_bytes"] = compressed_size
+            existing_entry["compressed_max_bytes"] = compressed_max_bytes
+            existing_entry["compressed_within_limit"] = compressed_ok
             entries[text_key] = existing_entry
             _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
             skip_count += 1
@@ -1343,6 +1424,15 @@ def generate_widescreen_artwork(
                 geometry_value=geometry,
                 blocked_attempts_value=blocked_attempts,
             )
+            compressed_ok, compressed_size = _compress_png_to_jpeg_max_bytes(
+                output_path,
+                compressed_output_path,
+                compressed_max_bytes,
+            )
+            entries[text_key]["compressed_output_path"] = str(compressed_output_path)
+            entries[text_key]["compressed_bytes"] = compressed_size
+            entries[text_key]["compressed_max_bytes"] = compressed_max_bytes
+            entries[text_key]["compressed_within_limit"] = compressed_ok
             if save_background_layer:
                 if background_output_path.exists():
                     entries[text_key]["background_output_path"] = str(background_output_path)
@@ -2883,6 +2973,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Output directory for widescreen PNGs + manifest",
     )
     widescreen_parser.add_argument(
+        "--background-dir",
+        type=Path,
+        default=None,
+        help="Directory for background-only PNG layers (default: sibling out/background)",
+    )
+    widescreen_parser.add_argument(
+        "--compressed-dir",
+        type=Path,
+        default=None,
+        help="Directory for compressed widescreen JPEGs (default: sibling out/widescreen-compressed)",
+    )
+    widescreen_parser.add_argument(
         "--map-json",
         type=Path,
         default=Path("out/album_id_map.json"),
@@ -2951,6 +3053,12 @@ def build_parser() -> argparse.ArgumentParser:
         choices=("ha-masked-outpaint", "reference-no-mask"),
         default="ha-masked-outpaint",
         help="Background generation route: masked outpaint or no-mask reference generation",
+    )
+    widescreen_parser.add_argument(
+        "--compressed-max-bytes",
+        type=int,
+        default=JPEG_MAX_BYTES_DEFAULT,
+        help="Maximum file size for compressed widescreen JPEG outputs",
     )
 
     return parser
@@ -3024,6 +3132,8 @@ def main() -> None:
         generate_widescreen_artwork(
             source_art_dir=args.source_art_dir,
             out_dir=args.out_dir,
+            background_dir=args.background_dir,
+            compressed_dir=args.compressed_dir,
             map_json=args.map_json,
             target_width=args.target_width,
             target_height=args.target_height,
@@ -3041,6 +3151,7 @@ def main() -> None:
             album_shadow=args.album_shadow,
             multipart_mode=args.multipart_mode,
             background_mode=args.background_mode,
+            compressed_max_bytes=args.compressed_max_bytes,
         )
         return
 
