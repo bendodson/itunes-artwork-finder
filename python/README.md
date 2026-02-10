@@ -136,8 +136,11 @@ Hires behavior:
 
 ## Phase 4: Generate Widescreen Frame TV Artwork (16:9)
 
-Generate 3840x2160 widescreen PNGs by placing each source square album image on a
-centered 1536x1536 region, then running image edits only on the surrounding area.
+Generate final 3840x2160 widescreen PNGs through a two-stage pipeline:
+- Stage 1 (API edit): build a 1536x1024 PNG canvas, place a centered album square,
+  and run OpenAI image edits only on the surrounding area.
+- Stage 2 (final output): upscale the edited 1536x1024 result to 3840x2160 with
+  LANCZOS, then re-paste the original album at the exact final center position.
 
 ```bash
 python python/album_cache.py generate-widescreen \
@@ -163,6 +166,9 @@ GPT-Image-1.5 editing behavior:
   - optional size for supported GPT image sizes (`1024x1024`, `1536x1024`, `1024x1536`)
 - If the runtime account/region rollout does not yet allow GPT-Image-1.5 for edits and the API returns a model-support error (for example `invalid model`), the script automatically falls back to `dall-e-2` so runs can continue.
 - Select GPT-Image-1.5 explicitly with `--model gpt-image-1.5`.
+- The edit mask is an RGBA PNG and must match image dimensions exactly. Transparent
+  pixels (`alpha=0`) are editable background; opaque pixels (`alpha=255`) protect
+  the centered album region.
 
 Defaults for `generate-widescreen`:
 - `--source-art-dir out/source_art`

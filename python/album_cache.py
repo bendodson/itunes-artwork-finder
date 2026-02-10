@@ -64,6 +64,8 @@ MIN_IMAGE_BYTES_DEFAULT = 5 * 1024
 WIDESCREEN_SKIP_BYTES_DEFAULT = 100 * 1024
 OPENAI_IMAGES_EDITS_ENDPOINT = "https://api.openai.com/v1/images/edits"
 OPENAI_GPT_IMAGE_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
+EDIT_WIDTH_DEFAULT = 1536
+EDIT_HEIGHT_DEFAULT = 1024
 
 
 @dataclass
@@ -286,6 +288,13 @@ def _image_to_png_bytes(image: Any) -> bytes:
     return buffer.getvalue()
 
 
+def validate_mask_pair(image: Any, mask: Any) -> None:
+    if image.size != mask.size:
+        raise RuntimeError(f"mask/image size mismatch {image.size} vs {mask.size}")
+    if mask.mode != "RGBA":
+        raise RuntimeError(f"mask must be RGBA for image edits, got {mask.mode}")
+
+
 def _parse_b64_image_from_edits_payload(payload: Dict[str, Any]) -> Optional[bytes]:
     data = payload.get("data")
     if not isinstance(data, list) or not data:
@@ -392,7 +401,7 @@ def _request_openai_image_edit_once(
 
     image_field = "image[]" if _is_gpt_image_model(model) else "image"
     files = [
-        (image_field, ("canvas.png", canvas_png, "image/png")),
+        (image_field, ("image.png", canvas_png, "image/png")),
         ("mask", ("mask.png", mask_png, "image/png")),
     ]
 
@@ -490,8 +499,8 @@ def _build_widescreen_prompt(style_profile: str) -> str:
 
 def _make_canvas_and_mask(
     source_path: Path,
-    target_width: int,
-    target_height: int,
+    edit_width: int,
+    edit_height: int,
     album_px: int,
 ) -> Tuple[Any, Any, Dict[str, int]]:
     assert PIL_AVAILABLE and Image is not None
@@ -502,22 +511,24 @@ def _make_canvas_and_mask(
     resized = album_image.copy()
     resized.thumbnail((album_px, album_px), _resample_lanczos())
 
-    x0 = (target_width - album_px) // 2
-    y0 = (target_height - album_px) // 2
+    x0 = (edit_width - album_px) // 2
+    y0 = (edit_height - album_px) // 2
     slot_x = (album_px - resized.width) // 2
     slot_y = (album_px - resized.height) // 2
 
-    canvas = Image.new("RGB", (target_width, target_height), (0, 0, 0))
+    canvas = Image.new("RGBA", (edit_width, edit_height), (0, 0, 0, 0))
     album_slot = Image.new("RGB", (album_px, album_px), (0, 0, 0))
     album_slot.paste(resized, (slot_x, slot_y))
     canvas.paste(album_slot, (x0, y0))
 
-    mask = Image.new("L", (target_width, target_height), 255)
-    mask.paste(0, (x0, y0, x0 + album_px, y0 + album_px))
+    # OpenAI image editing uses transparency-based masks:
+    # alpha=0 editable, alpha=255 protected.
+    mask = Image.new("RGBA", (edit_width, edit_height), (255, 255, 255, 0))
+    mask.paste((255, 255, 255, 255), (x0, y0, x0 + album_px, y0 + album_px))
 
     geometry = {
-        "target_width": target_width,
-        "target_height": target_height,
+        "edit_width": edit_width,
+        "edit_height": edit_height,
         "album_px": album_px,
         "x0": x0,
         "y0": y0,
@@ -584,6 +595,12 @@ def generate_widescreen_artwork(
         raise ValueError("limit must be >= 0")
 
     ensure_out_dir(out_dir)
+    final_w = target_width
+    final_h = target_height
+    edit_w = EDIT_WIDTH_DEFAULT
+    edit_h = EDIT_HEIGHT_DEFAULT
+    album_px_edit = round(album_px * (edit_w / final_w))
+    album_px_edit = max(256, min(album_px_edit, min(edit_w, edit_h) - 64))
 
     manifest_path = out_dir / "manifest.json"
     entries: Dict[str, Dict[str, Any]] = {}
@@ -619,7 +636,7 @@ def generate_widescreen_artwork(
     skip_count = 0
     err_count = 0
     generated_new_count = 0
-    openai_size = _derive_openai_size(target_width=target_width, target_height=target_height)
+    openai_size = _derive_openai_size(target_width=edit_w, target_height=edit_h)
 
     for index, text_key in enumerate(text_keys, start=1):
         if limit is not None and generated_new_count >= limit:
@@ -649,12 +666,21 @@ def generate_widescreen_artwork(
                 "model_requested": model,
                 "model_used": prior_used_model or model,
                 "style_profile": style_profile,
+                "edit_size": f"{edit_w}x{edit_h}",
+                "final_size": f"{final_w}x{final_h}",
+                "album_px_edit": album_px_edit,
+                "album_px_final": album_px,
                 "geometry": {
-                    "target_width": target_width,
-                    "target_height": target_height,
-                    "album_px": album_px,
-                    "x0": (target_width - album_px) // 2,
-                    "y0": (target_height - album_px) // 2,
+                    "edit_width": edit_w,
+                    "edit_height": edit_h,
+                    "final_width": final_w,
+                    "final_height": final_h,
+                    "album_px_edit": album_px_edit,
+                    "album_px_final": album_px,
+                    "x0_edit": (edit_w - album_px_edit) // 2,
+                    "y0_edit": (edit_h - album_px_edit) // 2,
+                    "x0_final": (final_w - album_px) // 2,
+                    "y0_final": (final_h - album_px) // 2,
                 },
             }
             entries[text_key] = existing_entry
@@ -679,6 +705,10 @@ def generate_widescreen_artwork(
                 "model_requested": model,
                 "model_used": "",
                 "style_profile": style_profile,
+                "edit_size": f"{edit_w}x{edit_h}",
+                "final_size": f"{final_w}x{final_h}",
+                "album_px_edit": album_px_edit,
+                "album_px_final": album_px,
             }
             _write_manifest(manifest_path, entries)
             err_count += 1
@@ -688,14 +718,19 @@ def generate_widescreen_artwork(
             continue
 
         temp_path = out_dir / f".{output_path.name}.part-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
+        used_model_for_entry = ""
         try:
             canvas, mask, geometry = _make_canvas_and_mask(
                 source_path=source_path,
-                target_width=target_width,
-                target_height=target_height,
-                album_px=album_px,
+                edit_width=edit_w,
+                edit_height=edit_h,
+                album_px=album_px_edit,
             )
             prompt = _build_widescreen_prompt(style_profile)
+            validate_mask_pair(canvas, mask)
+            if canvas.size != mask.size:
+                raise RuntimeError(f"mask/image size mismatch {canvas.size} vs {mask.size}")
+            assert canvas.size == mask.size, f"mask/image size mismatch {canvas.size} vs {mask.size}"
 
             if debug_save_canvas:
                 debug_canvas = canvas.copy()
@@ -703,7 +738,7 @@ def generate_widescreen_artwork(
                 debug_canvas.save(out_dir / f"{text_key}__debug_canvas.png", format="PNG")
                 mask.save(out_dir / f"{text_key}__debug_mask.png", format="PNG")
 
-            expected_album_patch = canvas.crop(
+            expected_album_patch_edit = canvas.crop(
                 (
                     geometry["x0"],
                     geometry["y0"],
@@ -711,30 +746,33 @@ def generate_widescreen_artwork(
                     geometry["y0"] + geometry["album_px"],
                 )
             )
+            canvas_png = _image_to_png_bytes(canvas)
+            mask_png = _image_to_png_bytes(mask)
 
             generated_bytes, api_error, used_model = _request_openai_image_edit(
-                canvas_png=_image_to_png_bytes(canvas),
-                mask_png=_image_to_png_bytes(mask),
+                canvas_png=canvas_png,
+                mask_png=mask_png,
                 prompt=prompt,
                 model=model,
                 seed=seed,
                 timeout_s=180,
                 size=openai_size,
             )
+            used_model_for_entry = used_model or model
             if api_error or not generated_bytes:
                 raise RuntimeError(api_error or "image-edit returned empty output")
 
-            generated = Image.open(io.BytesIO(generated_bytes)).convert("RGB")
-            if generated.size != (target_width, target_height):
+            generated_edit = Image.open(io.BytesIO(generated_bytes)).convert("RGBA")
+            if generated_edit.size != (edit_w, edit_h):
                 raise RuntimeError(
-                    f"invalid output size {generated.width}x{generated.height}; expected {target_width}x{target_height}"
+                    f"invalid output size {generated_edit.width}x{generated_edit.height}; expected {edit_w}x{edit_h}"
                 )
 
             # Enforce strict album pixel identity regardless of model behavior.
-            generated.paste(expected_album_patch, (geometry["x0"], geometry["y0"]))
+            generated_edit.paste(expected_album_patch_edit, (geometry["x0"], geometry["y0"]))
 
             if not _pixel_identical_region(
-                generated,
+                generated_edit,
                 canvas,
                 geometry["x0"],
                 geometry["y0"],
@@ -743,7 +781,26 @@ def generate_widescreen_artwork(
             ):
                 raise RuntimeError("album artwork region changed after generation")
 
-            generated.save(temp_path, format="PNG")
+            generated_final = generated_edit.resize((final_w, final_h), _resample_lanczos()).convert("RGB")
+
+            with Image.open(source_path) as source_image:
+                album_final = source_image.convert("RGB")
+            album_final.thumbnail((album_px, album_px), _resample_lanczos())
+            final_slot = Image.new("RGB", (album_px, album_px), (0, 0, 0))
+            final_slot_x = (album_px - album_final.width) // 2
+            final_slot_y = (album_px - album_final.height) // 2
+            final_slot.paste(album_final, (final_slot_x, final_slot_y))
+
+            fx = (final_w - album_px) // 2
+            fy = (final_h - album_px) // 2
+            expected_album_patch_final = final_slot.copy()
+            generated_final.paste(final_slot, (fx, fy))
+
+            actual = generated_final.crop((fx, fy, fx + album_px, fy + album_px))
+            if ImageChops.difference(actual, expected_album_patch_final).getbbox() is not None:
+                raise RuntimeError("album artwork region changed after final restore")
+
+            generated_final.save(temp_path, format="PNG")
             temp_path.replace(output_path)
 
             if output_path.stat().st_size <= MIN_IMAGE_BYTES_DEFAULT:
@@ -751,12 +808,17 @@ def generate_widescreen_artwork(
 
             # Final validation: exact expected dimensions.
             with Image.open(output_path) as final_image:
-                if final_image.size != (target_width, target_height):
+                if final_image.size != (final_w, final_h):
                     raise RuntimeError(
                         f"saved file has invalid size {final_image.width}x{final_image.height}; "
-                        f"expected {target_width}x{target_height}"
+                        f"expected {final_w}x{final_h}"
                     )
 
+            geometry["final_width"] = final_w
+            geometry["final_height"] = final_h
+            geometry["album_px_final"] = album_px
+            geometry["x0_final"] = fx
+            geometry["y0_final"] = fy
             entries[text_key] = {
                 "text_key": text_key,
                 "collectionId": collection_id or "",
@@ -767,8 +829,12 @@ def generate_widescreen_artwork(
                 "error_message": "",
                 "timestamp": _utc_now_iso(),
                 "model_requested": model,
-                "model_used": used_model or model,
+                "model_used": used_model_for_entry,
                 "style_profile": style_profile,
+                "edit_size": f"{edit_w}x{edit_h}",
+                "final_size": f"{final_w}x{final_h}",
+                "album_px_edit": album_px_edit,
+                "album_px_final": album_px,
                 "geometry": geometry,
             }
             ok_count += 1
@@ -786,8 +852,12 @@ def generate_widescreen_artwork(
                 "error_message": str(exc),
                 "timestamp": _utc_now_iso(),
                 "model_requested": model,
-                "model_used": "",
+                "model_used": used_model_for_entry,
                 "style_profile": style_profile,
+                "edit_size": f"{edit_w}x{edit_h}",
+                "final_size": f"{final_w}x{final_h}",
+                "album_px_edit": album_px_edit,
+                "album_px_final": album_px,
             }
             err_count += 1
         finally:
