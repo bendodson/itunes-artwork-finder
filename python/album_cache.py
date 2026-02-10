@@ -39,12 +39,14 @@ try:
     from PIL import Image
     from PIL import ImageChops
     from PIL import ImageDraw
+    from PIL import ImageOps
 
     PIL_AVAILABLE = True
 except Exception:
     Image = None
     ImageChops = None
     ImageDraw = None
+    ImageOps = None
     PIL_AVAILABLE = False
 
 SEARCH_ENDPOINT = "https://itunes.apple.com/search"
@@ -364,6 +366,20 @@ def _image_to_png_bytes(image: Any) -> bytes:
 def validate_mask_pair(image: Any, mask: Any) -> None:
     if image.size != mask.size:
         raise RuntimeError(f"mask/image size mismatch {image.size} vs {mask.size}")
+
+
+def _normalize_mask_for_openai(mask: Any) -> Any:
+    """Return an RGBA mask where alpha=0 marks editable pixels."""
+    assert Image is not None and ImageOps is not None
+    if getattr(mask, "mode", "") == "RGBA":
+        return mask
+    if getattr(mask, "mode", "") == "L":
+        alpha = ImageOps.invert(mask)
+    else:
+        alpha = ImageOps.invert(mask.convert("L"))
+    rgba = Image.new("RGBA", mask.size, (0, 0, 0, 0))
+    rgba.putalpha(alpha)
+    return rgba
 
 
 def _parse_b64_image_from_edits_payload(payload: Dict[str, Any]) -> Optional[bytes]:
@@ -1007,7 +1023,8 @@ def generate_widescreen_artwork(
                 )
 
             img_bytes = _image_to_png_bytes(canvas)
-            msk_bytes = _image_to_png_bytes(mask)
+            upload_mask = _normalize_mask_for_openai(mask)
+            msk_bytes = _image_to_png_bytes(upload_mask)
 
             with Image.open(BytesIO(img_bytes)) as upload_image_check:
                 upload_img_size = upload_image_check.size
