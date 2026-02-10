@@ -79,9 +79,11 @@ HA_PASTE_X = 256
 HA_PASTE_Y = 0
 HA_EDIT_SIZE = f"{HA_EDIT_WIDTH}x{HA_EDIT_HEIGHT}"
 HA_OUTPAINT_PROMPT = (
-    "Remove ALL text, typography, logos, label marks, and signatures from the entire image. "
+    "Preserve the original album artwork's subject matter, composition, palette, and style. "
+    "Do not replace the scene with unrelated content. "
+    "Remove ALL text, typography, logos, label marks, and signatures from editable regions only. "
     "Do not add any new text. Reconstruct removed areas as coherent artwork matching the existing style. "
-    "Then outpaint the image into seamless full-bleed 16:9 by extending naturally beyond the left/right edges. "
+    "Then outpaint into seamless full-bleed 16:9 by extending naturally beyond the left/right edges only. "
     "No borders, no mat, no frames, no captions."
 )
 
@@ -651,7 +653,14 @@ def build_ha_outpaint_canvas_and_mask(src_album_path: str) -> tuple[Image.Image,
     cover = source_rgb.resize((HA_CENTER_SIZE, HA_CENTER_SIZE), _resample_lanczos())
     canvas = Image.new("RGB", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), (0, 0, 0))
     canvas.paste(cover, (HA_PASTE_X, HA_PASTE_Y))
+    # Editable gutters only: protect the centered 1024x1024 album square.
+    # In our OpenAI normalization path, L=255 becomes alpha=0 (editable),
+    # and L=0 becomes alpha=255 (protected).
     mask = Image.new("L", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), 255)
+    ImageDraw.Draw(mask).rectangle(
+        (HA_PASTE_X, HA_PASTE_Y, HA_PASTE_X + HA_CENTER_SIZE - 1, HA_PASTE_Y + HA_CENTER_SIZE - 1),
+        fill=0,
+    )
     return canvas, mask
 
 
@@ -816,7 +825,7 @@ def generate_widescreen_artwork(
             "style_profile": style_profile,
             "prompt_variant": prompt_variant_value,
             "request_id": request_id_value,
-            "mask_mode": "full_edit",
+            "mask_mode": "gutter_outpaint_center_protected",
             "edit_size": f"{edit_w}x{edit_h}",
             "final_size": f"{final_w}x{final_h}",
             "album_px_edit": album_px_edit,
