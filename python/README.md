@@ -147,11 +147,22 @@ python python/album_cache.py generate-widescreen \
   --target-width 3840 \
   --target-height 2160 \
   --album-px 1536 \
-  --model gpt-image-1 \
+  --model gpt-image-1.5 \
   --style-profile neutral \
   --resume \
   --sleep-ms 2500
 ```
+
+GPT-Image-1.5 editing behavior:
+- Phase 4 uses OpenAI's Images edit API at `/v1/images/edits` (or `OPENAI_IMAGES_EDITS_URL` override).
+- The request uploads:
+  - base canvas image bytes (`image[]` for GPT image models)
+  - mask bytes (`mask`)
+  - prompt text (`prompt`)
+  - explicit model (`model=gpt-image-1.5` when requested)
+  - optional size for supported GPT image sizes (`1024x1024`, `1536x1024`, `1024x1536`)
+- If the runtime account/region rollout does not yet allow GPT-Image-1.5 for edits and the API returns a model-support error (for example `invalid model`), the script automatically falls back to `dall-e-2` so runs can continue.
+- Select GPT-Image-1.5 explicitly with `--model gpt-image-1.5`.
 
 Defaults for `generate-widescreen`:
 - `--source-art-dir out/source_art`
@@ -170,7 +181,7 @@ Other flags:
 
 Environment:
 - Set `OPENAI_API_KEY` before running.
-- Optional endpoint override: `OPENAI_IMAGES_EDITS_URL`.
+- Optional endpoint override: `OPENAI_IMAGES_EDITS_URL` (must point to an Images edits endpoint compatible with GPT image models for masked edits).
 
 Outputs:
 - Widescreen files in `out/widescreen/` named `<text_key>__3840x2160.png`

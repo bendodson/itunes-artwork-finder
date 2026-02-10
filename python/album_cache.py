@@ -63,7 +63,6 @@ CLEAN_KEYWORDS = ("clean",)
 MIN_IMAGE_BYTES_DEFAULT = 5 * 1024
 WIDESCREEN_SKIP_BYTES_DEFAULT = 100 * 1024
 OPENAI_IMAGES_EDITS_ENDPOINT = "https://api.openai.com/v1/images/edits"
-OPENAI_GPT_IMAGE_MODELS = ("gpt-image-1", "gpt-image-1-mini", "gpt-image-1.5")
 OPENAI_GPT_IMAGE_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
 
 
@@ -425,6 +424,7 @@ def _request_openai_image_edit(
     model: str,
     seed: Optional[int],
     timeout_s: int,
+    size: Optional[str],
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -433,11 +433,6 @@ def _request_openai_image_edit(
     endpoint = os.environ.get("OPENAI_IMAGES_EDITS_URL", OPENAI_IMAGES_EDITS_ENDPOINT).strip()
     if not endpoint:
         endpoint = OPENAI_IMAGES_EDITS_ENDPOINT
-
-    size = _derive_openai_size(target_width=canvas_png and 0 or 0, target_height=mask_png and 0 or 0)
-    # Use caller-provided dimensions where possible; we only send size for supported values.
-    # Size is optional and intentionally omitted for arbitrary large canvas dimensions.
-    size = None
 
     requested_model = (model or "").strip()
     fallback_model = "dall-e-2"
@@ -624,6 +619,7 @@ def generate_widescreen_artwork(
     skip_count = 0
     err_count = 0
     generated_new_count = 0
+    openai_size = _derive_openai_size(target_width=target_width, target_height=target_height)
 
     for index, text_key in enumerate(text_keys, start=1):
         if limit is not None and generated_new_count >= limit:
@@ -635,6 +631,12 @@ def generate_widescreen_artwork(
         output_path = out_dir / f"{text_key}__{target_width}x{target_height}.png"
 
         if resume and output_path.exists() and output_path.is_file() and output_path.stat().st_size > WIDESCREEN_SKIP_BYTES_DEFAULT:
+            prior = entries.get(text_key, {})
+            prior_used_model = ""
+            if isinstance(prior.get("model_used"), str):
+                prior_used_model = str(prior.get("model_used") or "")
+            elif isinstance(prior.get("model"), str):
+                prior_used_model = str(prior.get("model") or "")
             existing_entry = {
                 "text_key": text_key,
                 "collectionId": collection_id or "",
@@ -644,7 +646,8 @@ def generate_widescreen_artwork(
                 "status": "skip",
                 "error_message": "",
                 "timestamp": _utc_now_iso(),
-                "model": model,
+                "model_requested": model,
+                "model_used": prior_used_model or model,
                 "style_profile": style_profile,
                 "geometry": {
                     "target_width": target_width,
@@ -673,7 +676,8 @@ def generate_widescreen_artwork(
                 "status": "error",
                 "error_message": "source artwork not found",
                 "timestamp": _utc_now_iso(),
-                "model": model,
+                "model_requested": model,
+                "model_used": "",
                 "style_profile": style_profile,
             }
             _write_manifest(manifest_path, entries)
@@ -708,13 +712,14 @@ def generate_widescreen_artwork(
                 )
             )
 
-            generated_bytes, api_error = _request_openai_image_edit(
+            generated_bytes, api_error, used_model = _request_openai_image_edit(
                 canvas_png=_image_to_png_bytes(canvas),
                 mask_png=_image_to_png_bytes(mask),
                 prompt=prompt,
                 model=model,
                 seed=seed,
                 timeout_s=180,
+                size=openai_size,
             )
             if api_error or not generated_bytes:
                 raise RuntimeError(api_error or "image-edit returned empty output")
@@ -761,7 +766,8 @@ def generate_widescreen_artwork(
                 "status": "ok",
                 "error_message": "",
                 "timestamp": _utc_now_iso(),
-                "model": model,
+                "model_requested": model,
+                "model_used": used_model or model,
                 "style_profile": style_profile,
                 "geometry": geometry,
             }
@@ -779,7 +785,8 @@ def generate_widescreen_artwork(
                 "status": "error",
                 "error_message": str(exc),
                 "timestamp": _utc_now_iso(),
-                "model": model,
+                "model_requested": model,
+                "model_used": "",
                 "style_profile": style_profile,
             }
             err_count += 1
