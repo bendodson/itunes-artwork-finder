@@ -529,9 +529,6 @@ def _request_openai_image_edit_once(
         data["seed"] = str(seed)
     if size:
         data["size"] = size
-    if not _is_gpt_image_model(model):
-        data["response_format"] = "b64_json"
-
     if multipart_mode not in {"ha", "std"}:
         raise ValueError(f"invalid multipart_mode: {multipart_mode}")
 
@@ -613,71 +610,31 @@ def _request_openai_image_edit(
         endpoint = OPENAI_IMAGES_EDITS_ENDPOINT
 
     requested_model = (model or "").strip()
-    fallback_model = "dall-e-2"
-    candidate_models = [requested_model]
-    if requested_model and requested_model != fallback_model:
-        candidate_models.append(fallback_model)
+    if not requested_model:
+        return None, "missing model", None, False, ""
 
-    first_error: Optional[str] = None
-    first_request_id = ""
-    for idx, candidate_model in enumerate(candidate_models):
-        mode_candidates = [multipart_mode]
-        alt_mode = "std" if multipart_mode == "ha" else "ha"
-        last_error: Optional[str] = None
-        last_request_id = ""
-        last_unsupported_model = False
-        last_moderation_blocked = False
+    # HA pipeline is a single request with multipart image[] + mask.
+    enforced_mode = "ha"
+    if multipart_mode != enforced_mode and debug_upload_keys:
+        print(f"Ignoring multipart_mode={multipart_mode}; enforcing {enforced_mode}")
 
-        for mode_index, mode_candidate in enumerate(mode_candidates):
-            image_bytes, error_message, unsupported_model, moderation_blocked, request_id = _request_openai_image_edit_once(
-                canvas_png=canvas_png,
-                mask_png=mask_png,
-                prompt=prompt,
-                model=candidate_model,
-                seed=seed,
-                timeout_s=timeout_s,
-                size=size,
-                endpoint=endpoint,
-                api_key=api_key,
-                multipart_mode=mode_candidate,
-                debug_upload_keys=debug_upload_keys,
-                upload_debug_summary=upload_debug_summary,
-            )
-            if image_bytes:
-                return image_bytes, None, candidate_model, False, ""
-
-            last_error = error_message
-            last_request_id = request_id
-            last_unsupported_model = unsupported_model
-            last_moderation_blocked = moderation_blocked
-
-            if (
-                mode_index == 0
-                and alt_mode not in mode_candidates
-                and _is_invalid_mask_image_error_message(error_message)
-            ):
-                mode_candidates.append(alt_mode)
-                print(
-                    f"Retrying image-edit with alternate multipart mode: "
-                    f"{mode_candidate} -> {alt_mode}"
-                )
-                continue
-            break
-
-        if idx == 0:
-            first_error = last_error
-            first_request_id = last_request_id
-            if last_unsupported_model and len(candidate_models) > 1:
-                continue
-        return None, last_error, candidate_model, last_moderation_blocked, last_request_id
-
-    return (
-        None,
-        first_error or "image-edit request failed",
-        candidate_models[-1] if candidate_models else None,
-        False,
-        first_request_id,
+    image_bytes, error_message, _unsupported_model, moderation_blocked, request_id = _request_openai_image_edit_once(
+        canvas_png=canvas_png,
+        mask_png=mask_png,
+        prompt=prompt,
+        model=requested_model,
+        seed=seed,
+        timeout_s=timeout_s,
+        size=size,
+        endpoint=endpoint,
+        api_key=api_key,
+        multipart_mode=enforced_mode,
+        debug_upload_keys=debug_upload_keys,
+        upload_debug_summary=upload_debug_summary,
     )
+    if image_bytes:
+        return image_bytes, None, requested_model, False, request_id
+    return None, error_message or "image-edit request failed", requested_model, moderation_blocked, request_id
 
 
 def _load_album_square(source_path: Path, album_px: int) -> Any:
@@ -2735,7 +2692,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--multipart-mode",
         choices=("ha", "std"),
         default="ha",
-        help="Multipart image key mode for /v1/images/edits compatibility",
+        help="Legacy option; HA pipeline always uses image[] + mask multipart upload",
     )
     widescreen_parser.add_argument(
         "--preserve-album",
