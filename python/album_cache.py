@@ -493,7 +493,7 @@ def _request_openai_image_edit_once(
 
     image_field = "image[]" if _is_gpt_image_model(model) else "image"
     files = [
-        (image_field, ("image.png", canvas_png, "image/png")),
+        (image_field, ("input.png", canvas_png, "image/png")),
         ("mask", ("mask.png", mask_png, "image/png")),
     ]
 
@@ -513,11 +513,12 @@ def _request_openai_image_edit_once(
         payload = response.json()
     except ValueError as exc:
         return None, f"invalid JSON from image-edit endpoint: {exc}", False, False, ""
+    request_id = _extract_openai_request_id(response, payload)
 
     image_bytes = _parse_b64_image_from_edits_payload(payload)
     if not image_bytes:
-        return None, "image-edit response missing b64_json image payload", False, False, ""
-    return image_bytes, None, False, False, ""
+        return None, "image-edit response missing b64_json image payload", False, False, request_id
+    return image_bytes, None, False, False, request_id
 
 
 def _request_openai_image_edit(
@@ -732,7 +733,7 @@ def generate_widescreen_artwork(
     total = len(text_keys)
 
     if total == 0:
-        _write_manifest(manifest_path, entries)
+        _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
         print(f"No albums found in map: {map_json}")
         print(f"Wrote: {manifest_path}")
         return
@@ -743,39 +744,104 @@ def generate_widescreen_artwork(
     generated_new_count = 0
     openai_size = _derive_openai_size(target_width=edit_w, target_height=edit_h)
 
+    def _build_widescreen_entry(
+        *,
+        text_key_value: str,
+        content_id_value: Optional[int],
+        source_art_path_value: str,
+        output_path_value: Path,
+        bytes_value: int,
+        status_value: str,
+        error_message_value: str,
+        model_used_value: str,
+        prompt_variant_value: str,
+        request_id_value: str,
+        geometry_value: Optional[Dict[str, Any]] = None,
+        blocked_attempts_value: Optional[List[Dict[str, Any]]] = None,
+    ) -> Dict[str, Any]:
+        entry: Dict[str, Any] = {
+            "text_key": text_key_value,
+            "collection_id": content_id_value or "",
+            "collectionId": content_id_value or "",
+            "source_art_path": source_art_path_value,
+            "source_path": source_art_path_value,
+            "output_path": str(output_path_value),
+            "bytes": bytes_value,
+            "status": status_value,
+            "error_message": error_message_value,
+            "timestamp": _utc_now_iso(),
+            "model_requested": model,
+            "model_used": model_used_value,
+            "style_profile": style_profile,
+            "prompt_variant": prompt_variant_value,
+            "request_id": request_id_value,
+            "edit_size": f"{edit_w}x{edit_h}",
+            "final_size": f"{final_w}x{final_h}",
+            "album_px_edit": album_px_edit,
+            "album_px_final": album_px,
+        }
+        if geometry_value is not None:
+            entry["geometry"] = geometry_value
+        if blocked_attempts_value:
+            entry["blocked_attempts"] = blocked_attempts_value
+        return entry
+
     for index, text_key in enumerate(text_keys, start=1):
         if limit is not None and generated_new_count >= limit:
             print(f"Reached --limit={limit}; stopping run.")
             break
 
         record = album_map.get(text_key, {})
-        collection_id = _safe_int(record.get("collectionId"))
-        output_path = out_dir / f"{text_key}__{target_width}x{target_height}.png"
+        content_id = _resolve_widescreen_content_id(record)
+        output_path = out_dir / _widescreen_output_name(content_id, text_key, target_width, target_height)
+        legacy_output_path = out_dir / _legacy_widescreen_output_name(text_key, target_width, target_height)
 
-        if resume and output_path.exists() and output_path.is_file() and output_path.stat().st_size > WIDESCREEN_SKIP_BYTES_DEFAULT:
+        existing_output_path: Optional[Path] = None
+        if resume:
+            candidate_paths: List[Path] = [output_path, legacy_output_path]
+            prior_output_path = entries.get(text_key, {}).get("output_path")
+            if isinstance(prior_output_path, str) and prior_output_path.strip():
+                candidate_paths.append(Path(prior_output_path))
+            seen: set[str] = set()
+            for candidate in candidate_paths:
+                candidate_key = str(candidate)
+                if candidate_key in seen:
+                    continue
+                seen.add(candidate_key)
+                if (
+                    candidate.exists()
+                    and candidate.is_file()
+                    and candidate.stat().st_size > WIDESCREEN_SKIP_BYTES_DEFAULT
+                ):
+                    existing_output_path = candidate
+                    break
+
+        if existing_output_path is not None:
             prior = entries.get(text_key, {})
             prior_used_model = ""
             if isinstance(prior.get("model_used"), str):
                 prior_used_model = str(prior.get("model_used") or "")
             elif isinstance(prior.get("model"), str):
                 prior_used_model = str(prior.get("model") or "")
-            existing_entry = {
-                "text_key": text_key,
-                "collectionId": collection_id or "",
-                "source_path": entries.get(text_key, {}).get("source_path", ""),
-                "output_path": str(output_path),
-                "bytes": output_path.stat().st_size,
-                "status": "skip",
-                "error_message": "",
-                "timestamp": _utc_now_iso(),
-                "model_requested": model,
-                "model_used": prior_used_model or model,
-                "style_profile": style_profile,
-                "edit_size": f"{edit_w}x{edit_h}",
-                "final_size": f"{final_w}x{final_h}",
-                "album_px_edit": album_px_edit,
-                "album_px_final": album_px,
-                "geometry": {
+            source_art_path = str(
+                prior.get("source_art_path")
+                or prior.get("source_path")
+                or ""
+            )
+            prompt_variant = str(prior.get("prompt_variant") or "")
+            request_id = str(prior.get("request_id") or "")
+            existing_entry = _build_widescreen_entry(
+                text_key_value=text_key,
+                content_id_value=content_id,
+                source_art_path_value=source_art_path,
+                output_path_value=existing_output_path,
+                bytes_value=existing_output_path.stat().st_size,
+                status_value="skip",
+                error_message_value="",
+                model_used_value=prior_used_model or model,
+                prompt_variant_value=prompt_variant,
+                request_id_value=request_id,
+                geometry_value={
                     "edit_width": edit_w,
                     "edit_height": edit_h,
                     "final_width": final_w,
@@ -787,35 +853,30 @@ def generate_widescreen_artwork(
                     "x0_final": (final_w - album_px) // 2,
                     "y0_final": (final_h - album_px) // 2,
                 },
-            }
+            )
             entries[text_key] = existing_entry
-            _write_manifest(manifest_path, entries)
+            _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
             skip_count += 1
             print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
             if index < total and sleep_ms > 0:
                 _sleep_seconds(sleep_ms / 1000.0)
             continue
 
-        source_path = _find_source_art_path(source_art_dir, source_manifest_entries, text_key, collection_id)
+        source_path = _find_source_art_path(source_art_dir, source_manifest_entries, text_key, content_id)
         if source_path is None:
-            entries[text_key] = {
-                "text_key": text_key,
-                "collectionId": collection_id or "",
-                "source_path": "",
-                "output_path": str(output_path),
-                "bytes": 0,
-                "status": "error",
-                "error_message": "source artwork not found",
-                "timestamp": _utc_now_iso(),
-                "model_requested": model,
-                "model_used": "",
-                "style_profile": style_profile,
-                "edit_size": f"{edit_w}x{edit_h}",
-                "final_size": f"{final_w}x{final_h}",
-                "album_px_edit": album_px_edit,
-                "album_px_final": album_px,
-            }
-            _write_manifest(manifest_path, entries)
+            entries[text_key] = _build_widescreen_entry(
+                text_key_value=text_key,
+                content_id_value=content_id,
+                source_art_path_value="",
+                output_path_value=output_path,
+                bytes_value=0,
+                status_value="error",
+                error_message_value="source artwork not found",
+                model_used_value="",
+                prompt_variant_value="",
+                request_id_value="",
+            )
+            _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
             err_count += 1
             print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
             if index < total and sleep_ms > 0:
@@ -825,6 +886,8 @@ def generate_widescreen_artwork(
         temp_path = out_dir / f".{output_path.name}.part-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
         used_model_for_entry = ""
         blocked_attempts: List[Dict[str, Any]] = []
+        prompt_variant_used = ""
+        request_id_for_entry = ""
         try:
             canvas, mask, geometry = _make_canvas_and_mask(
                 source_path=source_path,
@@ -840,8 +903,9 @@ def generate_widescreen_artwork(
             if debug_save_canvas:
                 debug_canvas = canvas.copy()
                 _draw_debug_crosshair(debug_canvas)
-                debug_canvas.save(out_dir / f"{text_key}__debug_canvas.png", format="PNG")
-                mask.save(out_dir / f"{text_key}__debug_mask.png", format="PNG")
+                output_stem = _widescreen_output_stem(content_id, text_key)
+                debug_canvas.save(out_dir / f"{output_stem}__debug_canvas.png", format="PNG")
+                mask.save(out_dir / f"{output_stem}__debug_mask.png", format="PNG")
 
             expected_album_patch_edit = canvas.crop(
                 (
@@ -861,6 +925,7 @@ def generate_widescreen_artwork(
                 ("ultra_minimal", build_prompt_ultra_minimal()),
             ]
             for attempt_number, (prompt_variant, prompt_text) in enumerate(prompt_attempts, start=1):
+                prompt_variant_used = prompt_variant
                 generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
                     canvas_png=canvas_png,
                     mask_png=mask_png,
@@ -870,6 +935,7 @@ def generate_widescreen_artwork(
                     timeout_s=180,
                     size=openai_size,
                 )
+                request_id_for_entry = request_id or request_id_for_entry
                 if used_model:
                     used_model_for_entry = used_model
                 elif not used_model_for_entry:
@@ -893,24 +959,19 @@ def generate_widescreen_artwork(
                     if attempt_number == 1:
                         continue
 
-                    entries[text_key] = {
-                        "text_key": text_key,
-                        "collectionId": collection_id or "",
-                        "source_path": str(source_path),
-                        "output_path": str(output_path),
-                        "bytes": 0,
-                        "status": "blocked",
-                        "error_message": api_error or "moderation_blocked",
-                        "timestamp": _utc_now_iso(),
-                        "model_requested": model,
-                        "model_used": used_model_for_entry,
-                        "style_profile": style_profile,
-                        "edit_size": f"{edit_w}x{edit_h}",
-                        "final_size": f"{final_w}x{final_h}",
-                        "album_px_edit": album_px_edit,
-                        "album_px_final": album_px,
-                        "blocked_attempts": blocked_attempts,
-                    }
+                    entries[text_key] = _build_widescreen_entry(
+                        text_key_value=text_key,
+                        content_id_value=content_id,
+                        source_art_path_value=str(source_path),
+                        output_path_value=output_path,
+                        bytes_value=0,
+                        status_value="blocked",
+                        error_message_value=api_error or "moderation_blocked",
+                        model_used_value=used_model_for_entry,
+                        prompt_variant_value=prompt_variant_used,
+                        request_id_value=request_id_for_entry,
+                        blocked_attempts_value=blocked_attempts,
+                    )
                     err_count += 1
                     raise ModerationBlockedError(api_error or "moderation_blocked")
 
@@ -976,25 +1037,20 @@ def generate_widescreen_artwork(
             geometry["album_px_final"] = album_px
             geometry["x0_final"] = fx
             geometry["y0_final"] = fy
-            entries[text_key] = {
-                "text_key": text_key,
-                "collectionId": collection_id or "",
-                "source_path": str(source_path),
-                "output_path": str(output_path),
-                "bytes": output_path.stat().st_size,
-                "status": "ok",
-                "error_message": "",
-                "timestamp": _utc_now_iso(),
-                "model_requested": model,
-                "model_used": used_model_for_entry,
-                "style_profile": style_profile,
-                "edit_size": f"{edit_w}x{edit_h}",
-                "final_size": f"{final_w}x{final_h}",
-                "album_px_edit": album_px_edit,
-                "album_px_final": album_px,
-                "geometry": geometry,
-                "blocked_attempts": blocked_attempts,
-            }
+            entries[text_key] = _build_widescreen_entry(
+                text_key_value=text_key,
+                content_id_value=content_id,
+                source_art_path_value=str(source_path),
+                output_path_value=output_path,
+                bytes_value=output_path.stat().st_size,
+                status_value="ok",
+                error_message_value="",
+                model_used_value=used_model_for_entry,
+                prompt_variant_value=prompt_variant_used,
+                request_id_value=request_id_for_entry,
+                geometry_value=geometry,
+                blocked_attempts_value=blocked_attempts,
+            )
             ok_count += 1
             generated_new_count += 1
         except ModerationBlockedError:
@@ -1002,29 +1058,24 @@ def generate_widescreen_artwork(
         except Exception as exc:
             if temp_path.exists():
                 temp_path.unlink(missing_ok=True)
-            entries[text_key] = {
-                "text_key": text_key,
-                "collectionId": collection_id or "",
-                "source_path": str(source_path),
-                "output_path": str(output_path),
-                "bytes": 0,
-                "status": "error",
-                "error_message": str(exc),
-                "timestamp": _utc_now_iso(),
-                "model_requested": model,
-                "model_used": used_model_for_entry,
-                "style_profile": style_profile,
-                "edit_size": f"{edit_w}x{edit_h}",
-                "final_size": f"{final_w}x{final_h}",
-                "album_px_edit": album_px_edit,
-                "album_px_final": album_px,
-                "blocked_attempts": blocked_attempts,
-            }
+            entries[text_key] = _build_widescreen_entry(
+                text_key_value=text_key,
+                content_id_value=content_id,
+                source_art_path_value=str(source_path),
+                output_path_value=output_path,
+                bytes_value=0,
+                status_value="error",
+                error_message_value=str(exc),
+                model_used_value=used_model_for_entry,
+                prompt_variant_value=prompt_variant_used,
+                request_id_value=request_id_for_entry,
+                blocked_attempts_value=blocked_attempts,
+            )
             err_count += 1
         finally:
             if temp_path.exists():
                 temp_path.unlink(missing_ok=True)
-            _write_manifest(manifest_path, entries)
+            _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
             print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
             if index < total and sleep_ms > 0:
                 _sleep_seconds(sleep_ms / 1000.0)
