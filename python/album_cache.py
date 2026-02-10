@@ -67,6 +67,17 @@ OPENAI_IMAGES_EDITS_ENDPOINT = "https://api.openai.com/v1/images/edits"
 OPENAI_GPT_IMAGE_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
 EDIT_WIDTH_DEFAULT = 1536
 EDIT_HEIGHT_DEFAULT = 1024
+PHASE4_OUTPAINT_PROMPT = (
+    "Extend the central square artwork outward seamlessly into a full-bleed 16:9 image. "
+    "Treat the central square as a window: continue the same world, materials, tones, and textures "
+    "beyond the square edges so it feels like the image simply expands. "
+    "Match the exact palette, grain/texture, lighting, and era of the central square. "
+    "Do not introduce any new distinct subjects, scenes, or styles; do not invent unrelated environments. "
+    "No text, typography, logos, watermarks, UI, borders, frames, or mats."
+)
+PHASE4_OUTPAINT_TEXT_REMOVAL = (
+    "Remove any text in the entire image and reconstruct those areas to match the existing artwork."
+)
 
 
 @dataclass
@@ -586,6 +597,12 @@ def build_prompt_normal(style_profile: str) -> str:
     )
 
 
+def build_outpaint_prompt(remove_text: bool = True) -> str:
+    if not remove_text:
+        return PHASE4_OUTPAINT_PROMPT
+    return f"{PHASE4_OUTPAINT_PROMPT} {PHASE4_OUTPAINT_TEXT_REMOVAL}"
+
+
 def _load_album_square(source_path: Path, album_px: int) -> Any:
     assert PIL_AVAILABLE and Image is not None
     with Image.open(source_path) as source_image:
@@ -899,11 +916,11 @@ def generate_widescreen_artwork(
 
             generated_bytes: Optional[bytes] = None
             api_error: Optional[str] = None
-            prompt_variant_used = "normal"
+            prompt_variant_used = "outpaint"
             generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
                 canvas_png=canvas_png,
                 mask_png=mask_png,
-                prompt=build_prompt_normal(style_profile),
+                prompt=build_outpaint_prompt(remove_text=True),
                 model=model,
                 seed=seed,
                 timeout_s=180,
