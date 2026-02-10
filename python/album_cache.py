@@ -26,6 +26,7 @@ import unicodedata
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from io import BytesIO
 from pathlib import Path
 from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional, Tuple
@@ -355,7 +356,7 @@ def _draw_debug_crosshair(image: Any) -> None:
 
 
 def _image_to_png_bytes(image: Any) -> bytes:
-    buffer = io.BytesIO()
+    buffer = BytesIO()
     image.save(buffer, format="PNG")
     return buffer.getvalue()
 
@@ -503,11 +504,10 @@ def _request_openai_image_edit_once(
     if not _is_gpt_image_model(model):
         data["response_format"] = "b64_json"
 
-    image_field = "image[]" if _is_gpt_image_model(model) else "image"
-    files = [
-        (image_field, ("input.png", canvas_png, "image/png")),
-        ("mask", ("mask.png", mask_png, "image/png")),
-    ]
+    files = {
+        "image": ("input.png", BytesIO(canvas_png), "image/png"),
+        "mask": ("mask.png", BytesIO(mask_png), "image/png"),
+    }
 
     try:
         response = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_s)
@@ -566,7 +566,7 @@ def _request_openai_image_edit(
             model=candidate_model,
             seed=seed,
             timeout_s=timeout_s,
-            size=size if _is_gpt_image_model(candidate_model) else None,
+            size=size,
             endpoint=endpoint,
             api_key=api_key,
         )
@@ -598,12 +598,14 @@ def _load_album_square(source_path: Path, album_px: int) -> Any:
 
 def build_ha_outpaint_canvas_and_mask(src_album_path: str) -> tuple[Image.Image, Image.Image]:
     assert PIL_AVAILABLE and Image is not None
+    edit_w = 1536
+    edit_h = 1024
     with Image.open(src_album_path) as source_image:
         source_rgb = source_image.convert("RGB")
     cover = source_rgb.resize((HA_CENTER_SIZE, HA_CENTER_SIZE), _resample_lanczos())
-    canvas = Image.new("RGB", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), (0, 0, 0))
+    canvas = Image.new("RGB", (edit_w, edit_h), (0, 0, 0))
     canvas.paste(cover, (HA_PASTE_X, HA_PASTE_Y))
-    mask = Image.new("L", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), 255)
+    mask = Image.new("L", (edit_w, edit_h), 255)
     return canvas, mask
 
 
@@ -906,16 +908,31 @@ def generate_widescreen_artwork(
                 output_stem = _widescreen_output_stem(content_id, text_key)
                 debug_canvas.save(out_dir / f"{output_stem}__debug_canvas.png", format="PNG")
                 mask.save(out_dir / f"{output_stem}__debug_mask.png", format="PNG")
+                debug_last_canvas_path = out_dir / "debug_last_canvas.png"
+                debug_last_mask_path = out_dir / "debug_last_mask.png"
+                canvas.save(debug_last_canvas_path, format="PNG")
+                mask.save(debug_last_mask_path, format="PNG")
+                print(
+                    f"Debug canvas/mask saved: {debug_last_canvas_path} ({canvas.size}), "
+                    f"{debug_last_mask_path} ({mask.size})"
+                )
 
-            canvas_png = _image_to_png_bytes(canvas)
-            mask_png = _image_to_png_bytes(mask)
+            if canvas.size != mask.size:
+                raise RuntimeError(f"mask/image size mismatch: canvas={canvas.size} mask={mask.size}")
+
+            img_buf = BytesIO()
+            canvas.save(img_buf, format="PNG")
+            img_bytes = img_buf.getvalue()
+            msk_buf = BytesIO()
+            mask.save(msk_buf, format="PNG")
+            msk_bytes = msk_buf.getvalue()
 
             generated_bytes: Optional[bytes] = None
             api_error: Optional[str] = None
             prompt_variant_used = "ha_outpaint"
             generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
-                canvas_png=canvas_png,
-                mask_png=mask_png,
+                canvas_png=img_bytes,
+                mask_png=msk_bytes,
                 prompt=HA_OUTPAINT_PROMPT,
                 model=model,
                 seed=seed,
