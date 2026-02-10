@@ -39,6 +39,7 @@ try:
     from PIL import Image
     from PIL import ImageChops
     from PIL import ImageDraw
+    from PIL import ImageFilter
     from PIL import ImageOps
 
     PIL_AVAILABLE = True
@@ -46,6 +47,7 @@ except Exception:
     Image = None
     ImageChops = None
     ImageDraw = None
+    ImageFilter = None
     ImageOps = None
     PIL_AVAILABLE = False
 
@@ -817,6 +819,49 @@ def _replace_and_verify_album_region(image: Any, album_patch: Any, x: int, y: in
     return ImageChops.difference(actual, album_patch).getbbox() is None
 
 
+def _widescreen_background_output_name(content_id: Optional[int], text_key: str, width: int, height: int) -> str:
+    return f"{_widescreen_output_stem(content_id, text_key)}__{width}x{height}__background.png"
+
+
+def _legacy_widescreen_background_output_name(text_key: str, width: int, height: int) -> str:
+    return f"{text_key}__{width}x{height}__background.png"
+
+
+def _composite_album_with_shadow(
+    background_rgb: Any,
+    album_patch_rgb: Any,
+    x: int,
+    y: int,
+    album_px: int,
+    enabled: bool,
+) -> Any:
+    assert PIL_AVAILABLE and Image is not None and ImageDraw is not None
+    if background_rgb.mode != "RGBA":
+        base = background_rgb.convert("RGBA")
+    else:
+        base = background_rgb.copy()
+
+    if enabled and ImageFilter is not None:
+        # Subtle soft shadow to separate the centered album from busy backgrounds.
+        shadow_opacity = 88
+        shadow_blur = 26
+        shadow_dx = 0
+        shadow_dy = 16
+        shadow_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(shadow_layer)
+        draw.rectangle(
+            (x + shadow_dx, y + shadow_dy, x + shadow_dx + album_px, y + shadow_dy + album_px),
+            fill=(0, 0, 0, shadow_opacity),
+        )
+        shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=shadow_blur))
+        base = Image.alpha_composite(base, shadow_layer)
+
+    album_rgba = album_patch_rgb.convert("RGBA")
+    album_layer = Image.new("RGBA", base.size, (0, 0, 0, 0))
+    album_layer.paste(album_rgba, (x, y))
+    return Image.alpha_composite(base, album_layer).convert("RGB")
+
+
 def _find_source_art_path(
     source_art_dir: Path,
     source_manifest_entries: Dict[str, Dict[str, Any]],
@@ -854,6 +899,8 @@ def generate_widescreen_artwork(
     debug_upload_bytes: bool,
     limit: Optional[int],
     preserve_album: bool,
+    save_background_layer: bool,
+    album_shadow: bool,
     multipart_mode: str,
     background_mode: str,
 ) -> None:
@@ -961,6 +1008,8 @@ def generate_widescreen_artwork(
             ),
             "postprocess": "scale_to_width_center_crop",
             "preserve_album": preserve_album,
+            "save_background_layer": save_background_layer,
+            "album_shadow": album_shadow,
         }
         if geometry_value is not None:
             entry["geometry"] = geometry_value
@@ -976,7 +1025,9 @@ def generate_widescreen_artwork(
         record = album_map.get(text_key, {})
         content_id = _resolve_widescreen_content_id(record)
         output_path = out_dir / _widescreen_output_name(content_id, text_key, target_width, target_height)
+        background_output_path = out_dir / _widescreen_background_output_name(content_id, text_key, target_width, target_height)
         legacy_output_path = out_dir / _legacy_widescreen_output_name(text_key, target_width, target_height)
+        legacy_background_output_path = out_dir / _legacy_widescreen_background_output_name(text_key, target_width, target_height)
 
         existing_output_path: Optional[Path] = None
         if resume:
@@ -998,6 +1049,20 @@ def generate_widescreen_artwork(
                     existing_output_path = candidate
                     break
 
+        existing_background_path: Optional[Path] = None
+        if existing_output_path is not None:
+            if save_background_layer:
+                background_candidates: List[Path] = [background_output_path, legacy_background_output_path]
+                prior_background = entries.get(text_key, {}).get("background_output_path")
+                if isinstance(prior_background, str) and prior_background.strip():
+                    background_candidates.append(Path(prior_background))
+                for bg_candidate in background_candidates:
+                    if bg_candidate.exists() and bg_candidate.is_file() and bg_candidate.stat().st_size > MIN_IMAGE_BYTES_DEFAULT:
+                        existing_background_path = bg_candidate
+                        break
+                if existing_background_path is None:
+                    existing_output_path = None
+
         if existing_output_path is not None:
             prior = entries.get(text_key, {})
             prior_used_model = ""
@@ -1012,6 +1077,7 @@ def generate_widescreen_artwork(
             )
             prompt_variant = str(prior.get("prompt_variant") or "")
             request_id = str(prior.get("request_id") or "")
+            prior_background_path = str(prior.get("background_output_path") or "")
             existing_entry = _build_widescreen_entry(
                 text_key_value=text_key,
                 content_id_value=content_id,
@@ -1036,6 +1102,10 @@ def generate_widescreen_artwork(
                     "y0_final": (final_h - album_px) // 2,
                 },
             )
+            background_ref = existing_background_path or (Path(prior_background_path) if prior_background_path else None)
+            if background_ref and background_ref.exists():
+                existing_entry["background_output_path"] = str(background_ref)
+                existing_entry["background_bytes"] = background_ref.stat().st_size
             entries[text_key] = existing_entry
             _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
             skip_count += 1
@@ -1227,9 +1297,18 @@ def generate_widescreen_artwork(
             generated_final = ha_edit_to_frame(generated_edit, final_w=final_w, final_h=final_h).convert("RGB")
             fx = (final_w - album_px) // 2
             fy = (final_h - album_px) // 2
+            if save_background_layer:
+                generated_final.save(background_output_path, format="PNG")
             if preserve_album:
                 expected_album_patch_final = _load_album_square(source_path, album_px)
-                generated_final.paste(expected_album_patch_final, (fx, fy))
+                generated_final = _composite_album_with_shadow(
+                    background_rgb=generated_final,
+                    album_patch_rgb=expected_album_patch_final,
+                    x=fx,
+                    y=fy,
+                    album_px=album_px,
+                    enabled=album_shadow,
+                )
 
             generated_final.save(temp_path, format="PNG")
             temp_path.replace(output_path)
@@ -1264,6 +1343,13 @@ def generate_widescreen_artwork(
                 geometry_value=geometry,
                 blocked_attempts_value=blocked_attempts,
             )
+            if save_background_layer:
+                if background_output_path.exists():
+                    entries[text_key]["background_output_path"] = str(background_output_path)
+                    entries[text_key]["background_bytes"] = background_output_path.stat().st_size
+                elif legacy_background_output_path.exists():
+                    entries[text_key]["background_output_path"] = str(legacy_background_output_path)
+                    entries[text_key]["background_bytes"] = legacy_background_output_path.stat().st_size
             ok_count += 1
             generated_new_count += 1
         except ModerationBlockedError:
@@ -2849,6 +2935,18 @@ def build_parser() -> argparse.ArgumentParser:
         help="Paste the original square album art back into the exact center of the final output (default true)",
     )
     widescreen_parser.add_argument(
+        "--save-background-layer",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Save a background-only 3840x2160 PNG before album compositing (default true)",
+    )
+    widescreen_parser.add_argument(
+        "--album-shadow",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Apply a subtle soft drop shadow behind the centered album (default true)",
+    )
+    widescreen_parser.add_argument(
         "--background-mode",
         choices=("ha-masked-outpaint", "reference-no-mask"),
         default="ha-masked-outpaint",
@@ -2939,6 +3037,8 @@ def main() -> None:
             debug_upload_bytes=args.debug_upload_bytes,
             limit=args.limit,
             preserve_album=args.preserve_album,
+            save_background_layer=args.save_background_layer,
+            album_shadow=args.album_shadow,
             multipart_mode=args.multipart_mode,
             background_mode=args.background_mode,
         )

@@ -157,6 +157,8 @@ python python/album_cache.py generate-widescreen \
   --album-px 1536 \
   --model gpt-image-1.5 \
   --background-mode reference-no-mask \
+  --save-background-layer \
+  --album-shadow \
   --style-profile neutral \
   --resume \
   --sleep-ms 2500
@@ -191,6 +193,8 @@ Defaults for `generate-widescreen`:
 Other flags:
 - `--seed` (optional)
 - `--debug-save-canvas` (saves debug canvas/mask per album)
+- `--save-background-layer / --no-save-background-layer` (default on)
+- `--album-shadow / --no-album-shadow` (default on)
 
 Environment:
 - Set `OPENAI_API_KEY` before running.
@@ -198,6 +202,7 @@ Environment:
 
 Outputs:
 - Widescreen files in `out/widescreen/` named `<collectionId-or-contentId>__3840x2160.png`
+- Optional background-only files named `<collectionId-or-contentId>__3840x2160__background.png`
 - If both IDs are missing, fallback naming is `unknown__<sha1(text_key)[:12]>__3840x2160.png`
 - Run manifest in `out/widescreen/manifest.json`
 - Optional lookup index in `out/widescreen/index.json`
