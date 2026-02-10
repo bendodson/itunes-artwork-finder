@@ -27,3 +27,6 @@ python/Library.xml
 
 # OS
 .DS_Store
+
+# Codex local context artifacts
+.codex/context/
