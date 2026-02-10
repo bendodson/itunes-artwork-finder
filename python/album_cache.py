@@ -488,6 +488,7 @@ def _request_openai_image_edit_once(
     size: Optional[str],
     endpoint: str,
     api_key: str,
+    upload_debug_summary: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str], bool, bool, str]:
     headers = {
         "Authorization": f"Bearer {api_key}",
@@ -519,7 +520,18 @@ def _request_openai_image_edit_once(
         unsupported_model = _is_model_not_supported_error(response.status_code, detail, payload)
         moderation_blocked = _is_moderation_blocked_error(response.status_code, detail, payload)
         request_id = _extract_openai_request_id(response, payload)
-        return None, f"image-edit HTTP {response.status_code}: {detail}", unsupported_model, moderation_blocked, request_id
+        error_text = f"image-edit HTTP {response.status_code}: {detail}"
+        if response.status_code == 400:
+            body_preview = response.text.strip()
+            if len(body_preview) > 800:
+                body_preview = body_preview[:800]
+            request_id_for_msg = request_id or "n/a"
+            error_text = (
+                f"{error_text} | request_id={request_id_for_msg} | body[:800]={body_preview}"
+            )
+            if upload_debug_summary:
+                error_text = f"{error_text} | {upload_debug_summary}"
+        return None, error_text, unsupported_model, moderation_blocked, request_id
 
     try:
         payload = response.json()
@@ -541,6 +553,7 @@ def _request_openai_image_edit(
     seed: Optional[int],
     timeout_s: int,
     size: Optional[str],
+    upload_debug_summary: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str], bool, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
@@ -569,6 +582,7 @@ def _request_openai_image_edit(
             size=size,
             endpoint=endpoint,
             api_key=api_key,
+            upload_debug_summary=upload_debug_summary,
         )
         if image_bytes:
             return image_bytes, None, candidate_model, False, ""
@@ -598,14 +612,12 @@ def _load_album_square(source_path: Path, album_px: int) -> Any:
 
 def build_ha_outpaint_canvas_and_mask(src_album_path: str) -> tuple[Image.Image, Image.Image]:
     assert PIL_AVAILABLE and Image is not None
-    edit_w = 1536
-    edit_h = 1024
     with Image.open(src_album_path) as source_image:
         source_rgb = source_image.convert("RGB")
     cover = source_rgb.resize((HA_CENTER_SIZE, HA_CENTER_SIZE), _resample_lanczos())
-    canvas = Image.new("RGB", (edit_w, edit_h), (0, 0, 0))
+    canvas = Image.new("RGB", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), (0, 0, 0))
     canvas.paste(cover, (HA_PASTE_X, HA_PASTE_Y))
-    mask = Image.new("L", (edit_w, edit_h), 255)
+    mask = Image.new("L", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), 255)
     return canvas, mask
 
 
@@ -677,6 +689,7 @@ def generate_widescreen_artwork(
     sleep_ms: int,
     seed: Optional[int],
     debug_save_canvas: bool,
+    debug_upload_bytes: bool,
     limit: Optional[int],
     preserve_album: bool,
 ) -> None:
@@ -889,8 +902,7 @@ def generate_widescreen_artwork(
             canvas, mask = build_ha_outpaint_canvas_and_mask(str(source_path))
             validate_mask_pair(canvas, mask)
             if canvas.size != mask.size:
-                raise RuntimeError(f"mask/image size mismatch {canvas.size} vs {mask.size}")
-            assert canvas.size == mask.size, f"mask/image size mismatch {canvas.size} vs {mask.size}"
+                raise RuntimeError(f"mask/image size mismatch: canvas={canvas.size} mask={mask.size}")
             geometry = {
                 "edit_width": edit_w,
                 "edit_height": edit_h,
@@ -919,13 +931,56 @@ def generate_widescreen_artwork(
 
             if canvas.size != mask.size:
                 raise RuntimeError(f"mask/image size mismatch: canvas={canvas.size} mask={mask.size}")
+            if canvas.size != (edit_w, edit_h):
+                raise RuntimeError(
+                    f"canvas size mismatch: canvas={canvas.size} expected={(edit_w, edit_h)}"
+                )
+            if mask.size != (edit_w, edit_h):
+                raise RuntimeError(
+                    f"mask size mismatch: mask={mask.size} expected={(edit_w, edit_h)}"
+                )
+            if openai_size != f"{edit_w}x{edit_h}":
+                raise RuntimeError(
+                    f"size mismatch: data[size]={openai_size} expected={edit_w}x{edit_h}"
+                )
 
-            img_buf = BytesIO()
-            canvas.save(img_buf, format="PNG")
-            img_bytes = img_buf.getvalue()
-            msk_buf = BytesIO()
-            mask.save(msk_buf, format="PNG")
-            msk_bytes = msk_buf.getvalue()
+            img_bytes = _image_to_png_bytes(canvas)
+            msk_bytes = _image_to_png_bytes(mask)
+
+            with Image.open(BytesIO(img_bytes)) as upload_image_check:
+                upload_img_size = upload_image_check.size
+                upload_img_mode = upload_image_check.mode
+            with Image.open(BytesIO(msk_bytes)) as upload_mask_check:
+                upload_mask_size = upload_mask_check.size
+                upload_mask_mode = upload_mask_check.mode
+
+            if upload_img_size != upload_mask_size:
+                raise RuntimeError(
+                    f"serialized upload mismatch: image={upload_img_size} mask={upload_mask_size}"
+                )
+            if upload_img_size != (edit_w, edit_h):
+                raise RuntimeError(
+                    f"serialized upload size mismatch: upload={upload_img_size} expected={(edit_w, edit_h)}"
+                )
+
+            upload_debug_summary = (
+                f"upload_image_size={upload_img_size} upload_image_mode={upload_img_mode} "
+                f"upload_mask_size={upload_mask_size} upload_mask_mode={upload_mask_mode} "
+                f"edit_size={openai_size}"
+            )
+
+            if debug_upload_bytes:
+                debug_upload_dir = Path("out/_debug")
+                debug_upload_dir.mkdir(parents=True, exist_ok=True)
+                upload_image_path = debug_upload_dir / "upload_image.png"
+                upload_mask_path = debug_upload_dir / "upload_mask.png"
+                upload_image_path.write_bytes(img_bytes)
+                upload_mask_path.write_bytes(msk_bytes)
+                with Image.open(upload_image_path) as saved_upload_image:
+                    print(f"UPLOAD image size={saved_upload_image.size} mode={saved_upload_image.mode}")
+                with Image.open(upload_mask_path) as saved_upload_mask:
+                    print(f"UPLOAD mask  size={saved_upload_mask.size} mode={saved_upload_mask.mode}")
+                print(f"UPLOAD intended edit size={openai_size}")
 
             generated_bytes: Optional[bytes] = None
             api_error: Optional[str] = None
@@ -938,6 +993,7 @@ def generate_widescreen_artwork(
                 seed=seed,
                 timeout_s=180,
                 size=openai_size,
+                upload_debug_summary=upload_debug_summary if debug_upload_bytes else None,
             )
             request_id_for_entry = request_id or request_id_for_entry
             if used_model:
@@ -2590,6 +2646,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="Save debug canvas + mask with a center crosshair",
     )
     widescreen_parser.add_argument(
+        "--debug-upload-bytes",
+        action="store_true",
+        help="Write exact uploaded edit image/mask PNG bytes to out/_debug and log dimensions/modes",
+    )
+    widescreen_parser.add_argument(
         "--preserve-album",
         action="store_true",
         help="Paste the original square album art back into the exact center of the final output",
@@ -2676,6 +2737,7 @@ def main() -> None:
             sleep_ms=args.sleep_ms,
             seed=args.seed,
             debug_save_canvas=args.debug_save_canvas,
+            debug_upload_bytes=args.debug_upload_bytes,
             limit=args.limit,
             preserve_album=args.preserve_album,
         )
