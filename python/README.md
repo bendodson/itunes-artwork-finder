@@ -142,6 +142,11 @@ Generate final 3840x2160 widescreen PNGs through a two-stage pipeline:
 - Stage 2 (final output): upscale the edited 1536x1024 result to 3840x2160 with
   LANCZOS, then re-paste the original album at the exact final center position.
 
+Alternative route for policy-sensitive runs:
+- `--background-mode reference-no-mask`: uploads only a reference canvas (no mask)
+  and asks the model to generate an original 16:9 background matching palette/mood.
+  The script then pastes the original album back into the final center.
+
 ```bash
 python python/album_cache.py generate-widescreen \
   --source-art-dir out/source_art \
@@ -151,6 +156,7 @@ python python/album_cache.py generate-widescreen \
   --target-height 2160 \
   --album-px 1536 \
   --model gpt-image-1.5 \
+  --background-mode reference-no-mask \
   --style-profile neutral \
   --resume \
   --sleep-ms 2500
@@ -169,6 +175,7 @@ GPT-Image-1.5 editing behavior:
 - The edit mask is an RGBA PNG and must match image dimensions exactly. Transparent
   pixels (`alpha=0`) are editable background; opaque pixels (`alpha=255`) protect
   the centered album region.
+- In `reference-no-mask` mode, no mask is uploaded (`image[]` only).
 
 Defaults for `generate-widescreen`:
 - `--source-art-dir out/source_art`

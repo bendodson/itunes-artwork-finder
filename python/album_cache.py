@@ -86,6 +86,13 @@ HA_OUTPAINT_PROMPT = (
     "Then outpaint into seamless full-bleed 16:9 by extending naturally beyond the left/right edges only. "
     "No borders, no mat, no frames, no captions."
 )
+REFERENCE_BACKGROUND_PROMPT = (
+    "Create an original seamless 16:9 full-bleed background inspired by the reference album cover's "
+    "color palette, lighting, mood, and visual texture. "
+    "Keep the result atmospheric and cohesive for a TV backdrop. "
+    "Do not include any text, logos, labels, signatures, watermarks, faces, or copyrighted characters. "
+    "Do not recreate the exact album cover composition."
+)
 
 
 @dataclass
@@ -639,6 +646,118 @@ def _request_openai_image_edit(
     return None, error_message or "image-edit request failed", requested_model, moderation_blocked, request_id
 
 
+def _request_openai_reference_background_once(
+    canvas_png: bytes,
+    prompt: str,
+    model: str,
+    seed: Optional[int],
+    timeout_s: int,
+    size: Optional[str],
+    endpoint: str,
+    api_key: str,
+    debug_upload_keys: bool,
+    upload_debug_summary: Optional[str] = None,
+) -> Tuple[Optional[bytes], Optional[str], bool, bool, str]:
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+    }
+    data: Dict[str, Any] = {
+        "model": model,
+        "prompt": prompt,
+    }
+    if seed is not None:
+        data["seed"] = str(seed)
+    if size:
+        data["size"] = size
+
+    files: List[Tuple[str, Tuple[str, BytesIO, str]]] = [
+        ("image[]", ("input.png", BytesIO(canvas_png), "image/png")),
+    ]
+    multipart_keys = [key for key, _ in files]
+    if multipart_keys != ["image[]"]:
+        raise RuntimeError(f"invalid multipart keys for reference mode: {multipart_keys}")
+    if "image" in data or "image[]" in data or "mask" in data:
+        raise RuntimeError("multipart keys must not appear in form data")
+
+    if debug_upload_keys:
+        print("UPLOAD multipart keys: ['image[]']")
+
+    try:
+        response = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_s)
+    except RequestException as exc:
+        return None, f"image-reference request error: {exc}", False, False, ""
+
+    if response.status_code != 200:
+        detail, payload = _extract_openai_error_text(response)
+        unsupported_model = _is_model_not_supported_error(response.status_code, detail, payload)
+        moderation_blocked = _is_moderation_blocked_error(response.status_code, detail, payload)
+        request_id = _extract_openai_request_id(response, payload)
+        error_text = f"image-reference HTTP {response.status_code}: {detail}"
+        if response.status_code == 400:
+            body_preview = response.text.strip()
+            if len(body_preview) > 800:
+                body_preview = body_preview[:800]
+            request_id_for_msg = request_id or "n/a"
+            error_text = (
+                f"{error_text} | request_id={request_id_for_msg} | body[:800]={body_preview}"
+            )
+            if upload_debug_summary:
+                error_text = f"{error_text} | {upload_debug_summary}"
+        return None, error_text, unsupported_model, moderation_blocked, request_id
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        return None, f"invalid JSON from image-reference endpoint: {exc}", False, False, ""
+    request_id = _extract_openai_request_id(response, payload)
+
+    image_bytes = _parse_b64_image_from_edits_payload(payload)
+    if not image_bytes:
+        return None, "image-reference response missing b64_json image payload", False, False, request_id
+    return image_bytes, None, False, False, request_id
+
+
+def _request_openai_reference_background(
+    canvas_png: bytes,
+    prompt: str,
+    model: str,
+    seed: Optional[int],
+    timeout_s: int,
+    size: Optional[str],
+    debug_upload_keys: bool,
+    upload_debug_summary: Optional[str] = None,
+) -> Tuple[Optional[bytes], Optional[str], Optional[str], bool, str]:
+    api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        return None, "missing OPENAI_API_KEY", None, False, ""
+
+    endpoint = os.environ.get("OPENAI_IMAGES_EDITS_URL", OPENAI_IMAGES_EDITS_ENDPOINT).strip()
+    if not endpoint:
+        endpoint = OPENAI_IMAGES_EDITS_ENDPOINT
+
+    requested_model = (model or "").strip()
+    if not requested_model:
+        return None, "missing model", None, False, ""
+
+    image_bytes, error_message, _unsupported_model, moderation_blocked, request_id = (
+        _request_openai_reference_background_once(
+            canvas_png=canvas_png,
+            prompt=prompt,
+            model=requested_model,
+            seed=seed,
+            timeout_s=timeout_s,
+            size=size,
+            endpoint=endpoint,
+            api_key=api_key,
+            debug_upload_keys=debug_upload_keys,
+            upload_debug_summary=upload_debug_summary,
+        )
+    )
+    if image_bytes:
+        return image_bytes, None, requested_model, False, request_id
+    return None, error_message or "image-reference request failed", requested_model, moderation_blocked, request_id
+
+
 def _load_album_square(source_path: Path, album_px: int) -> Any:
     assert PIL_AVAILABLE and Image is not None
     with Image.open(source_path) as source_image:
@@ -736,6 +855,7 @@ def generate_widescreen_artwork(
     limit: Optional[int],
     preserve_album: bool,
     multipart_mode: str,
+    background_mode: str,
 ) -> None:
     if not PIL_AVAILABLE or Image is None or ImageChops is None or ImageDraw is None:
         raise RuntimeError("Pillow is required for generate-widescreen. Install: pip install pillow")
@@ -825,12 +945,20 @@ def generate_widescreen_artwork(
             "style_profile": style_profile,
             "prompt_variant": prompt_variant_value,
             "request_id": request_id_value,
-            "mask_mode": "gutter_outpaint_center_protected",
+            "mask_mode": (
+                "gutter_outpaint_center_protected"
+                if background_mode == "ha-masked-outpaint"
+                else "none"
+            ),
             "edit_size": f"{edit_w}x{edit_h}",
             "final_size": f"{final_w}x{final_h}",
             "album_px_edit": album_px_edit,
             "album_px_final": album_px,
-            "pipeline": "ha_outpaint",
+            "pipeline": (
+                "ha_outpaint"
+                if background_mode == "ha-masked-outpaint"
+                else "reference_no_mask"
+            ),
             "postprocess": "scale_to_width_center_crop",
             "preserve_album": preserve_album,
         }
@@ -944,9 +1072,6 @@ def generate_widescreen_artwork(
         request_id_for_entry = ""
         try:
             canvas, mask = build_ha_outpaint_canvas_and_mask(str(source_path))
-            validate_mask_pair(canvas, mask)
-            if canvas.size != mask.size:
-                raise RuntimeError(f"mask/image size mismatch: canvas={canvas.size} mask={mask.size}")
             geometry = {
                 "edit_width": edit_w,
                 "edit_height": edit_h,
@@ -963,25 +1088,21 @@ def generate_widescreen_artwork(
                 _draw_debug_crosshair(debug_canvas)
                 output_stem = _widescreen_output_stem(content_id, text_key)
                 debug_canvas.save(out_dir / f"{output_stem}__debug_canvas.png", format="PNG")
-                mask.save(out_dir / f"{output_stem}__debug_mask.png", format="PNG")
+                if background_mode == "ha-masked-outpaint":
+                    mask.save(out_dir / f"{output_stem}__debug_mask.png", format="PNG")
                 debug_last_canvas_path = out_dir / "debug_last_canvas.png"
                 debug_last_mask_path = out_dir / "debug_last_mask.png"
                 canvas.save(debug_last_canvas_path, format="PNG")
-                mask.save(debug_last_mask_path, format="PNG")
+                if background_mode == "ha-masked-outpaint":
+                    mask.save(debug_last_mask_path, format="PNG")
                 print(
                     f"Debug canvas/mask saved: {debug_last_canvas_path} ({canvas.size}), "
                     f"{debug_last_mask_path} ({mask.size})"
                 )
 
-            if canvas.size != mask.size:
-                raise RuntimeError(f"mask/image size mismatch: canvas={canvas.size} mask={mask.size}")
             if canvas.size != (edit_w, edit_h):
                 raise RuntimeError(
                     f"canvas size mismatch: canvas={canvas.size} expected={(edit_w, edit_h)}"
-                )
-            if mask.size != (edit_w, edit_h):
-                raise RuntimeError(
-                    f"mask size mismatch: mask={mask.size} expected={(edit_w, edit_h)}"
                 )
             if openai_size != f"{edit_w}x{edit_h}":
                 raise RuntimeError(
@@ -989,59 +1110,75 @@ def generate_widescreen_artwork(
                 )
 
             img_bytes = _image_to_png_bytes(canvas)
-            upload_mask = _normalize_mask_for_openai(mask)
-            msk_bytes = _image_to_png_bytes(upload_mask)
-
             with Image.open(BytesIO(img_bytes)) as upload_image_check:
                 upload_img_size = upload_image_check.size
                 upload_img_mode = upload_image_check.mode
-            with Image.open(BytesIO(msk_bytes)) as upload_mask_check:
-                upload_mask_size = upload_mask_check.size
-                upload_mask_mode = upload_mask_check.mode
-
-            if upload_img_size != upload_mask_size:
-                raise RuntimeError(
-                    f"serialized upload mismatch: image={upload_img_size} mask={upload_mask_size}"
-                )
             if upload_img_size != (edit_w, edit_h):
                 raise RuntimeError(
                     f"serialized upload size mismatch: upload={upload_img_size} expected={(edit_w, edit_h)}"
                 )
 
-            upload_debug_summary = (
-                f"upload_image_size={upload_img_size} upload_image_mode={upload_img_mode} "
-                f"upload_mask_size={upload_mask_size} upload_mask_mode={upload_mask_mode} "
-                f"edit_size={openai_size}"
-            )
+            upload_debug_summary = f"upload_image_size={upload_img_size} upload_image_mode={upload_img_mode} edit_size={openai_size}"
 
             if debug_upload_bytes:
                 debug_upload_dir = Path("out/_debug")
                 debug_upload_dir.mkdir(parents=True, exist_ok=True)
                 upload_image_path = debug_upload_dir / "upload_image.png"
-                upload_mask_path = debug_upload_dir / "upload_mask.png"
                 upload_image_path.write_bytes(img_bytes)
-                upload_mask_path.write_bytes(msk_bytes)
                 with Image.open(upload_image_path) as saved_upload_image:
                     print(f"UPLOAD image size={saved_upload_image.size} mode={saved_upload_image.mode}")
-                with Image.open(upload_mask_path) as saved_upload_mask:
-                    print(f"UPLOAD mask  size={saved_upload_mask.size} mode={saved_upload_mask.mode}")
+                if background_mode == "ha-masked-outpaint":
+                    upload_mask = _normalize_mask_for_openai(mask)
+                    msk_bytes = _image_to_png_bytes(upload_mask)
+                    upload_mask_path = debug_upload_dir / "upload_mask.png"
+                    upload_mask_path.write_bytes(msk_bytes)
+                    with Image.open(upload_mask_path) as saved_upload_mask:
+                        print(f"UPLOAD mask  size={saved_upload_mask.size} mode={saved_upload_mask.mode}")
                 print(f"UPLOAD intended edit size={openai_size}")
 
             generated_bytes: Optional[bytes] = None
             api_error: Optional[str] = None
-            prompt_variant_used = "ha_outpaint"
-            generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
-                canvas_png=img_bytes,
-                mask_png=msk_bytes,
-                prompt=HA_OUTPAINT_PROMPT,
-                model=model,
-                seed=seed,
-                timeout_s=180,
-                size=openai_size,
-                multipart_mode=multipart_mode,
-                debug_upload_keys=debug_upload_bytes,
-                upload_debug_summary=upload_debug_summary if debug_upload_bytes else None,
-            )
+            if background_mode == "ha-masked-outpaint":
+                upload_mask = _normalize_mask_for_openai(mask)
+                msk_bytes = _image_to_png_bytes(upload_mask)
+                with Image.open(BytesIO(msk_bytes)) as upload_mask_check:
+                    upload_mask_size = upload_mask_check.size
+                    upload_mask_mode = upload_mask_check.mode
+                if upload_img_size != upload_mask_size:
+                    raise RuntimeError(
+                        f"serialized upload mismatch: image={upload_img_size} mask={upload_mask_size}"
+                    )
+                prompt_variant_used = "ha_outpaint"
+                upload_debug_summary_masked = (
+                    f"{upload_debug_summary} upload_mask_size={upload_mask_size} "
+                    f"upload_mask_mode={upload_mask_mode}"
+                )
+                generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
+                    canvas_png=img_bytes,
+                    mask_png=msk_bytes,
+                    prompt=HA_OUTPAINT_PROMPT,
+                    model=model,
+                    seed=seed,
+                    timeout_s=180,
+                    size=openai_size,
+                    multipart_mode=multipart_mode,
+                    debug_upload_keys=debug_upload_bytes,
+                    upload_debug_summary=upload_debug_summary_masked if debug_upload_bytes else None,
+                )
+            else:
+                prompt_variant_used = "reference_background_nomask"
+                generated_bytes, api_error, used_model, moderation_blocked, request_id = (
+                    _request_openai_reference_background(
+                        canvas_png=img_bytes,
+                        prompt=REFERENCE_BACKGROUND_PROMPT,
+                        model=model,
+                        seed=seed,
+                        timeout_s=180,
+                        size=openai_size,
+                        debug_upload_keys=debug_upload_bytes,
+                        upload_debug_summary=upload_debug_summary if debug_upload_bytes else None,
+                    )
+                )
             request_id_for_entry = request_id or request_id_for_entry
             if used_model:
                 used_model_for_entry = used_model
@@ -2709,6 +2846,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=True,
         help="Paste the original square album art back into the exact center of the final output (default true)",
     )
+    widescreen_parser.add_argument(
+        "--background-mode",
+        choices=("ha-masked-outpaint", "reference-no-mask"),
+        default="ha-masked-outpaint",
+        help="Background generation route: masked outpaint or no-mask reference generation",
+    )
 
     return parser
 
@@ -2795,6 +2938,7 @@ def main() -> None:
             limit=args.limit,
             preserve_album=args.preserve_album,
             multipart_mode=args.multipart_mode,
+            background_mode=args.background_mode,
         )
         return
 
