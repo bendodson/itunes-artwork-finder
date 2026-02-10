@@ -488,6 +488,7 @@ def _request_openai_image_edit_once(
     size: Optional[str],
     endpoint: str,
     api_key: str,
+    multipart_mode: str,
     upload_debug_summary: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str], bool, bool, str]:
     headers = {
@@ -505,10 +506,25 @@ def _request_openai_image_edit_once(
     if not _is_gpt_image_model(model):
         data["response_format"] = "b64_json"
 
-    files = {
-        "image": ("input.png", BytesIO(canvas_png), "image/png"),
-        "mask": ("mask.png", BytesIO(mask_png), "image/png"),
-    }
+    files: List[Tuple[str, Tuple[str, BytesIO, str]]] = []
+    if multipart_mode == "ha":
+        files = [
+            ("image[]", ("input.png", BytesIO(canvas_png), "image/png")),
+            ("mask", ("mask.png", BytesIO(mask_png), "image/png")),
+        ]
+    elif multipart_mode == "standard":
+        files = [
+            ("image", ("input.png", BytesIO(canvas_png), "image/png")),
+            ("mask", ("mask.png", BytesIO(mask_png), "image/png")),
+        ]
+    elif multipart_mode == "both":
+        files = [
+            ("image[]", ("input.png", BytesIO(canvas_png), "image/png")),
+            ("image", ("input.png", BytesIO(canvas_png), "image/png")),
+            ("mask", ("mask.png", BytesIO(mask_png), "image/png")),
+        ]
+    else:
+        raise ValueError(f"invalid multipart_mode: {multipart_mode}")
 
     try:
         response = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_s)
@@ -553,6 +569,7 @@ def _request_openai_image_edit(
     seed: Optional[int],
     timeout_s: int,
     size: Optional[str],
+    multipart_mode: str,
     upload_debug_summary: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str], bool, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -582,6 +599,7 @@ def _request_openai_image_edit(
             size=size,
             endpoint=endpoint,
             api_key=api_key,
+            multipart_mode=multipart_mode,
             upload_debug_summary=upload_debug_summary,
         )
         if image_bytes:
@@ -692,6 +710,7 @@ def generate_widescreen_artwork(
     debug_upload_bytes: bool,
     limit: Optional[int],
     preserve_album: bool,
+    multipart_mode: str,
 ) -> None:
     if not PIL_AVAILABLE or Image is None or ImageChops is None or ImageDraw is None:
         raise RuntimeError("Pillow is required for generate-widescreen. Install: pip install pillow")
@@ -993,6 +1012,7 @@ def generate_widescreen_artwork(
                 seed=seed,
                 timeout_s=180,
                 size=openai_size,
+                multipart_mode=multipart_mode,
                 upload_debug_summary=upload_debug_summary if debug_upload_bytes else None,
             )
             request_id_for_entry = request_id or request_id_for_entry
@@ -2651,6 +2671,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="Write exact uploaded edit image/mask PNG bytes to out/_debug and log dimensions/modes",
     )
     widescreen_parser.add_argument(
+        "--multipart-mode",
+        choices=("ha", "standard", "both"),
+        default="ha",
+        help="Multipart image key mode for /v1/images/edits compatibility",
+    )
+    widescreen_parser.add_argument(
         "--preserve-album",
         action="store_true",
         help="Paste the original square album art back into the exact center of the final output",
@@ -2740,6 +2766,7 @@ def main() -> None:
             debug_upload_bytes=args.debug_upload_bytes,
             limit=args.limit,
             preserve_album=args.preserve_album,
+            multipart_mode=args.multipart_mode,
         )
         return
 
