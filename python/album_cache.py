@@ -577,30 +577,20 @@ def _request_openai_image_edit(
     )
 
 
-def _safe_style_prompt_fragment(style_profile: str) -> str:
-    if style_profile == "ambient":
-        return "Use a muted palette with soft haze, color field gradients, and subtle texture."
-    if style_profile == "minimal":
-        return "Use a muted palette with minimal grain, soft gradients, and non-representational color fields."
-    if style_profile == "painterly":
-        return "Use a muted palette with paper texture, soft gradients, and minimal grain."
-    return "Use a muted palette with soft gradients, subtle texture, and minimal grain."
-
-
 def build_prompt_normal(style_profile: str) -> str:
-    suffix = _safe_style_prompt_fragment(style_profile)
     return (
-        "Create a calm, abstract, non-representational background around a fixed central square artwork that must remain unchanged. "
-        "Generate only outside the central square. "
-        "Use minimal color field composition, soft gradients, and subtle texture. "
-        "No text, logos, watermarks, UI, borders, or frames. "
-        "No people or recognizable subjects. "
-        f"{suffix}"
+        "Remove all text, typography, logos, label marks, and signatures from the entire image; "
+        "do not add any new text. Reconstruct removed areas to match the existing artwork style. "
+        "Then outpaint seamlessly to a full-bleed 16:9 image by extending naturally into the surrounding space. "
+        "No borders, mats, frames, captions, UI, or watermarks."
     )
 
 
-def build_prompt_ultra_minimal() -> str:
-    return "Abstract background only. Do not change the central square. No text."
+def _load_album_square(source_path: Path, album_px: int) -> Any:
+    assert PIL_AVAILABLE and Image is not None
+    with Image.open(source_path) as source_image:
+        album_rgb = source_image.convert("RGB")
+    return album_rgb.resize((album_px, album_px), _resample_lanczos())
 
 
 def _make_canvas_and_mask(
@@ -611,26 +601,17 @@ def _make_canvas_and_mask(
 ) -> Tuple[Any, Any, Dict[str, int]]:
     assert PIL_AVAILABLE and Image is not None
 
-    with Image.open(source_path) as source_image:
-        album_image = source_image.convert("RGB")
-
-    resized = album_image.copy()
-    resized.thumbnail((album_px, album_px), _resample_lanczos())
+    resized = _load_album_square(source_path, album_px)
 
     x0 = (edit_width - album_px) // 2
     y0 = (edit_height - album_px) // 2
-    slot_x = (album_px - resized.width) // 2
-    slot_y = (album_px - resized.height) // 2
 
     canvas = Image.new("RGBA", (edit_width, edit_height), (0, 0, 0, 0))
-    album_slot = Image.new("RGB", (album_px, album_px), (0, 0, 0))
-    album_slot.paste(resized, (slot_x, slot_y))
-    canvas.paste(album_slot, (x0, y0))
+    canvas.paste(resized, (x0, y0))
 
     # OpenAI image editing uses transparency-based masks:
     # alpha=0 editable, alpha=255 protected.
     mask = Image.new("RGBA", (edit_width, edit_height), (255, 255, 255, 0))
-    mask.paste((255, 255, 255, 255), (x0, y0, x0 + album_px, y0 + album_px))
 
     geometry = {
         "edit_width": edit_width,
@@ -638,8 +619,6 @@ def _make_canvas_and_mask(
         "album_px": album_px,
         "x0": x0,
         "y0": y0,
-        "slot_x": slot_x,
-        "slot_y": slot_y,
         "resized_width": resized.width,
         "resized_height": resized.height,
     }
@@ -652,6 +631,13 @@ def _pixel_identical_region(lhs: Any, rhs: Any, x: int, y: int, w: int, h: int) 
     right = rhs.crop((x, y, x + w, y + h))
     diff = ImageChops.difference(left, right)
     return diff.getbbox() is None
+
+
+def _replace_and_verify_album_region(image: Any, album_patch: Any, x: int, y: int, album_px: int) -> bool:
+    assert ImageChops is not None
+    image.paste(album_patch, (x, y))
+    actual = image.crop((x, y, x + album_px, y + album_px))
+    return ImageChops.difference(actual, album_patch).getbbox() is None
 
 
 def _find_source_art_path(
@@ -775,6 +761,7 @@ def generate_widescreen_artwork(
             "style_profile": style_profile,
             "prompt_variant": prompt_variant_value,
             "request_id": request_id_value,
+            "mask_mode": "full_edit",
             "edit_size": f"{edit_w}x{edit_h}",
             "final_size": f"{final_w}x{final_h}",
             "album_px_edit": album_px_edit,
@@ -907,75 +894,54 @@ def generate_widescreen_artwork(
                 debug_canvas.save(out_dir / f"{output_stem}__debug_canvas.png", format="PNG")
                 mask.save(out_dir / f"{output_stem}__debug_mask.png", format="PNG")
 
-            expected_album_patch_edit = canvas.crop(
-                (
-                    geometry["x0"],
-                    geometry["y0"],
-                    geometry["x0"] + geometry["album_px"],
-                    geometry["y0"] + geometry["album_px"],
-                )
-            )
             canvas_png = _image_to_png_bytes(canvas)
             mask_png = _image_to_png_bytes(mask)
 
             generated_bytes: Optional[bytes] = None
             api_error: Optional[str] = None
-            prompt_attempts = [
-                ("normal", build_prompt_normal(style_profile)),
-                ("ultra_minimal", build_prompt_ultra_minimal()),
-            ]
-            for attempt_number, (prompt_variant, prompt_text) in enumerate(prompt_attempts, start=1):
-                prompt_variant_used = prompt_variant
-                generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
-                    canvas_png=canvas_png,
-                    mask_png=mask_png,
-                    prompt=prompt_text,
-                    model=model,
-                    seed=seed,
-                    timeout_s=180,
-                    size=openai_size,
+            prompt_variant_used = "normal"
+            generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
+                canvas_png=canvas_png,
+                mask_png=mask_png,
+                prompt=build_prompt_normal(style_profile),
+                model=model,
+                seed=seed,
+                timeout_s=180,
+                size=openai_size,
+            )
+            request_id_for_entry = request_id or request_id_for_entry
+            if used_model:
+                used_model_for_entry = used_model
+            elif not used_model_for_entry:
+                used_model_for_entry = model
+
+            if moderation_blocked:
+                blocked_attempt = {
+                    "text_key": text_key,
+                    "attempt": 1,
+                    "prompt_variant": prompt_variant_used,
+                    "request_id": request_id,
+                }
+                blocked_attempts.append(blocked_attempt)
+                print(
+                    f"Blocked: text_key={text_key} attempt=1 "
+                    f"prompt_variant={prompt_variant_used} request_id={request_id or 'n/a'}"
                 )
-                request_id_for_entry = request_id or request_id_for_entry
-                if used_model:
-                    used_model_for_entry = used_model
-                elif not used_model_for_entry:
-                    used_model_for_entry = model
-
-                if generated_bytes:
-                    break
-
-                if moderation_blocked:
-                    blocked_attempt = {
-                        "text_key": text_key,
-                        "attempt": attempt_number,
-                        "prompt_variant": prompt_variant,
-                        "request_id": request_id,
-                    }
-                    blocked_attempts.append(blocked_attempt)
-                    print(
-                        f"Blocked: text_key={text_key} attempt={attempt_number} "
-                        f"prompt_variant={prompt_variant} request_id={request_id or 'n/a'}"
-                    )
-                    if attempt_number == 1:
-                        continue
-
-                    entries[text_key] = _build_widescreen_entry(
-                        text_key_value=text_key,
-                        content_id_value=content_id,
-                        source_art_path_value=str(source_path),
-                        output_path_value=output_path,
-                        bytes_value=0,
-                        status_value="blocked",
-                        error_message_value=api_error or "moderation_blocked",
-                        model_used_value=used_model_for_entry,
-                        prompt_variant_value=prompt_variant_used,
-                        request_id_value=request_id_for_entry,
-                        blocked_attempts_value=blocked_attempts,
-                    )
-                    err_count += 1
-                    raise ModerationBlockedError(api_error or "moderation_blocked")
-
-                raise RuntimeError(api_error or "image-edit returned empty output")
+                entries[text_key] = _build_widescreen_entry(
+                    text_key_value=text_key,
+                    content_id_value=content_id,
+                    source_art_path_value=str(source_path),
+                    output_path_value=output_path,
+                    bytes_value=0,
+                    status_value="blocked",
+                    error_message_value=api_error or "moderation_blocked",
+                    model_used_value=used_model_for_entry,
+                    prompt_variant_value=prompt_variant_used,
+                    request_id_value=request_id_for_entry,
+                    blocked_attempts_value=blocked_attempts,
+                )
+                err_count += 1
+                raise ModerationBlockedError(api_error or "moderation_blocked")
 
             if not generated_bytes:
                 raise RuntimeError(api_error or "image-edit returned empty output")
@@ -986,37 +952,14 @@ def generate_widescreen_artwork(
                     f"invalid output size {generated_edit.width}x{generated_edit.height}; expected {edit_w}x{edit_h}"
                 )
 
-            # Enforce strict album pixel identity regardless of model behavior.
-            generated_edit.paste(expected_album_patch_edit, (geometry["x0"], geometry["y0"]))
-
-            if not _pixel_identical_region(
-                generated_edit,
-                canvas,
-                geometry["x0"],
-                geometry["y0"],
-                geometry["album_px"],
-                geometry["album_px"],
-            ):
-                raise RuntimeError("album artwork region changed after generation")
-
             generated_final = generated_edit.resize((final_w, final_h), _resample_lanczos()).convert("RGB")
-
-            with Image.open(source_path) as source_image:
-                album_final = source_image.convert("RGB")
-            album_final.thumbnail((album_px, album_px), _resample_lanczos())
-            final_slot = Image.new("RGB", (album_px, album_px), (0, 0, 0))
-            final_slot_x = (album_px - album_final.width) // 2
-            final_slot_y = (album_px - album_final.height) // 2
-            final_slot.paste(album_final, (final_slot_x, final_slot_y))
 
             fx = (final_w - album_px) // 2
             fy = (final_h - album_px) // 2
-            expected_album_patch_final = final_slot.copy()
-            generated_final.paste(final_slot, (fx, fy))
-
-            actual = generated_final.crop((fx, fy, fx + album_px, fy + album_px))
-            if ImageChops.difference(actual, expected_album_patch_final).getbbox() is not None:
-                raise RuntimeError("album artwork region changed after final restore")
+            expected_album_patch_final = _load_album_square(source_path, album_px)
+            if not _replace_and_verify_album_region(generated_final, expected_album_patch_final, fx, fy, album_px):
+                if not _replace_and_verify_album_region(generated_final, expected_album_patch_final, fx, fy, album_px):
+                    raise RuntimeError("album artwork region changed after final restore")
 
             generated_final.save(temp_path, format="PNG")
             temp_path.replace(output_path)
