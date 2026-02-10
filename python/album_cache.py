@@ -364,8 +364,6 @@ def _image_to_png_bytes(image: Any) -> bytes:
 def validate_mask_pair(image: Any, mask: Any) -> None:
     if image.size != mask.size:
         raise RuntimeError(f"mask/image size mismatch {image.size} vs {mask.size}")
-    if getattr(mask, "mode", "") != "RGBA":
-        raise RuntimeError(f"mask mode must be RGBA; got {getattr(mask, 'mode', '')}")
 
 
 def _parse_b64_image_from_edits_payload(payload: Dict[str, Any]) -> Optional[bytes]:
