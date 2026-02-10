@@ -364,6 +364,8 @@ def _image_to_png_bytes(image: Any) -> bytes:
 def validate_mask_pair(image: Any, mask: Any) -> None:
     if image.size != mask.size:
         raise RuntimeError(f"mask/image size mismatch {image.size} vs {mask.size}")
+    if getattr(mask, "mode", "") != "RGBA":
+        raise RuntimeError(f"mask mode must be RGBA; got {getattr(mask, 'mode', '')}")
 
 
 def _parse_b64_image_from_edits_payload(payload: Dict[str, Any]) -> Optional[bytes]:
@@ -464,6 +466,15 @@ def _is_moderation_blocked_error(status_code: int, detail: str, payload: Optiona
                     haystack_parts.append(value)
     haystack = " ".join(haystack_parts).lower()
     return "moderation_blocked" in haystack or "safety system" in haystack
+
+
+def _is_invalid_mask_image_error_message(error_message: Optional[str]) -> bool:
+    haystack = (error_message or "").lower()
+    return (
+        "invalid_mask_image_format" in haystack
+        or "invalid mask image format" in haystack
+        or "mask size does not match image size" in haystack
+    )
 
 
 def _is_gpt_image_model(model: str) -> bool:
@@ -596,29 +607,55 @@ def _request_openai_image_edit(
     first_error: Optional[str] = None
     first_request_id = ""
     for idx, candidate_model in enumerate(candidate_models):
-        image_bytes, error_message, unsupported_model, moderation_blocked, request_id = _request_openai_image_edit_once(
-            canvas_png=canvas_png,
-            mask_png=mask_png,
-            prompt=prompt,
-            model=candidate_model,
-            seed=seed,
-            timeout_s=timeout_s,
-            size=size,
-            endpoint=endpoint,
-            api_key=api_key,
-            multipart_mode=multipart_mode,
-            debug_upload_keys=debug_upload_keys,
-            upload_debug_summary=upload_debug_summary,
-        )
-        if image_bytes:
-            return image_bytes, None, candidate_model, False, ""
+        mode_candidates = [multipart_mode]
+        alt_mode = "std" if multipart_mode == "ha" else "ha"
+        last_error: Optional[str] = None
+        last_request_id = ""
+        last_unsupported_model = False
+        last_moderation_blocked = False
+
+        for mode_index, mode_candidate in enumerate(mode_candidates):
+            image_bytes, error_message, unsupported_model, moderation_blocked, request_id = _request_openai_image_edit_once(
+                canvas_png=canvas_png,
+                mask_png=mask_png,
+                prompt=prompt,
+                model=candidate_model,
+                seed=seed,
+                timeout_s=timeout_s,
+                size=size,
+                endpoint=endpoint,
+                api_key=api_key,
+                multipart_mode=mode_candidate,
+                debug_upload_keys=debug_upload_keys,
+                upload_debug_summary=upload_debug_summary,
+            )
+            if image_bytes:
+                return image_bytes, None, candidate_model, False, ""
+
+            last_error = error_message
+            last_request_id = request_id
+            last_unsupported_model = unsupported_model
+            last_moderation_blocked = moderation_blocked
+
+            if (
+                mode_index == 0
+                and alt_mode not in mode_candidates
+                and _is_invalid_mask_image_error_message(error_message)
+            ):
+                mode_candidates.append(alt_mode)
+                print(
+                    f"Retrying image-edit with alternate multipart mode: "
+                    f"{mode_candidate} -> {alt_mode}"
+                )
+                continue
+            break
 
         if idx == 0:
-            first_error = error_message
-            first_request_id = request_id
-            if unsupported_model and len(candidate_models) > 1:
+            first_error = last_error
+            first_request_id = last_request_id
+            if last_unsupported_model and len(candidate_models) > 1:
                 continue
-        return None, error_message, candidate_model, moderation_blocked, request_id
+        return None, last_error, candidate_model, last_moderation_blocked, last_request_id
 
     return (
         None,
