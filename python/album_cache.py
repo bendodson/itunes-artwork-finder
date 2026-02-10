@@ -79,6 +79,10 @@ class Candidate:
     result: Dict[str, Any]
 
 
+class ModerationBlockedError(RuntimeError):
+    """Raised when image edit is blocked after the single allowed retry."""
+
+
 def normalize_text(value: str) -> str:
     """Normalize text for matching and dedupe keys."""
     if not value:
@@ -334,6 +338,25 @@ def _extract_openai_error_text(response: Response) -> Tuple[str, Optional[Dict[s
     return detail, payload
 
 
+def _extract_openai_request_id(response: Response, payload: Optional[Dict[str, Any]]) -> str:
+    if isinstance(payload, dict):
+        for key in ("request_id", "requestId", "x_request_id"):
+            value = payload.get(key)
+            if isinstance(value, str) and value.strip():
+                return value.strip()
+        error = payload.get("error")
+        if isinstance(error, dict):
+            for key in ("request_id", "requestId"):
+                value = error.get(key)
+                if isinstance(value, str) and value.strip():
+                    return value.strip()
+    for header_name in ("x-request-id", "request-id"):
+        value = response.headers.get(header_name, "").strip()
+        if value:
+            return value
+    return ""
+
+
 def _is_model_not_supported_error(status_code: int, detail: str, payload: Optional[Dict[str, Any]]) -> bool:
     if status_code not in {400, 404, 422}:
         return False
@@ -361,6 +384,21 @@ def _is_model_not_supported_error(status_code: int, detail: str, payload: Option
     )
 
 
+def _is_moderation_blocked_error(status_code: int, detail: str, payload: Optional[Dict[str, Any]]) -> bool:
+    if status_code != 400:
+        return False
+    haystack_parts = [detail]
+    if isinstance(payload, dict):
+        error = payload.get("error")
+        if isinstance(error, dict):
+            for key in ("message", "type", "code", "param"):
+                value = error.get(key)
+                if isinstance(value, str):
+                    haystack_parts.append(value)
+    haystack = " ".join(haystack_parts).lower()
+    return "moderation_blocked" in haystack or "safety system" in haystack
+
+
 def _is_gpt_image_model(model: str) -> bool:
     normalized = (model or "").strip().lower()
     return normalized.startswith("gpt-image-")
@@ -383,7 +421,7 @@ def _request_openai_image_edit_once(
     size: Optional[str],
     endpoint: str,
     api_key: str,
-) -> Tuple[Optional[bytes], Optional[str], bool]:
+) -> Tuple[Optional[bytes], Optional[str], bool, bool, str]:
     headers = {
         "Authorization": f"Bearer {api_key}",
     }
@@ -408,22 +446,24 @@ def _request_openai_image_edit_once(
     try:
         response = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_s)
     except RequestException as exc:
-        return None, f"image-edit request error: {exc}", False
+        return None, f"image-edit request error: {exc}", False, False, ""
 
     if response.status_code != 200:
         detail, payload = _extract_openai_error_text(response)
         unsupported_model = _is_model_not_supported_error(response.status_code, detail, payload)
-        return None, f"image-edit HTTP {response.status_code}: {detail}", unsupported_model
+        moderation_blocked = _is_moderation_blocked_error(response.status_code, detail, payload)
+        request_id = _extract_openai_request_id(response, payload)
+        return None, f"image-edit HTTP {response.status_code}: {detail}", unsupported_model, moderation_blocked, request_id
 
     try:
         payload = response.json()
     except ValueError as exc:
-        return None, f"invalid JSON from image-edit endpoint: {exc}", False
+        return None, f"invalid JSON from image-edit endpoint: {exc}", False, False, ""
 
     image_bytes = _parse_b64_image_from_edits_payload(payload)
     if not image_bytes:
-        return None, "image-edit response missing b64_json image payload", False
-    return image_bytes, None, False
+        return None, "image-edit response missing b64_json image payload", False, False, ""
+    return image_bytes, None, False, False, ""
 
 
 def _request_openai_image_edit(
@@ -434,10 +474,10 @@ def _request_openai_image_edit(
     seed: Optional[int],
     timeout_s: int,
     size: Optional[str],
-) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+) -> Tuple[Optional[bytes], Optional[str], Optional[str], bool, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
     if not api_key:
-        return None, "missing OPENAI_API_KEY", None
+        return None, "missing OPENAI_API_KEY", None, False, ""
 
     endpoint = os.environ.get("OPENAI_IMAGES_EDITS_URL", OPENAI_IMAGES_EDITS_ENDPOINT).strip()
     if not endpoint:
@@ -450,8 +490,9 @@ def _request_openai_image_edit(
         candidate_models.append(fallback_model)
 
     first_error: Optional[str] = None
+    first_request_id = ""
     for idx, candidate_model in enumerate(candidate_models):
-        image_bytes, error_message, unsupported_model = _request_openai_image_edit_once(
+        image_bytes, error_message, unsupported_model, moderation_blocked, request_id = _request_openai_image_edit_once(
             canvas_png=canvas_png,
             mask_png=mask_png,
             prompt=prompt,
@@ -463,38 +504,48 @@ def _request_openai_image_edit(
             api_key=api_key,
         )
         if image_bytes:
-            return image_bytes, None, candidate_model
+            return image_bytes, None, candidate_model, False, ""
 
         if idx == 0:
             first_error = error_message
+            first_request_id = request_id
             if unsupported_model and len(candidate_models) > 1:
                 continue
-        return None, error_message, candidate_model
+        return None, error_message, candidate_model, moderation_blocked, request_id
 
-    return None, first_error or "image-edit request failed", candidate_models[-1] if candidate_models else None
-
-
-def _profile_prompt_suffix(style_profile: str) -> str:
-    if style_profile == "ambient":
-        return "Use soft atmospheric gradients, subtle bloom, and cinematic depth with gentle transitions."
-    if style_profile == "minimal":
-        return "Use restrained shapes, sparse composition, and clean tonal transitions with minimal detail."
-    if style_profile == "painterly":
-        return "Use painterly textures, visible brush-like surfaces, organic light falloff, and layered depth."
-    return "Use balanced realism with subtle texture, natural gradients, and depth that feels calm and neutral."
-
-
-def _build_widescreen_prompt(style_profile: str) -> str:
-    suffix = _profile_prompt_suffix(style_profile)
     return (
-        "Create a widescreen background environment that complements the central album artwork without touching it. "
-        "The album artwork is fixed and must remain unchanged. "
-        "Do not alter, redraw, crop, or paint over the central album artwork. "
-        "Generate imagery only in the surrounding background. "
-        "Extend atmosphere, texture, color, and depth outward from the album into the surrounding space. "
-        "No text, no frames, no borders, no UI elements. "
+        None,
+        first_error or "image-edit request failed",
+        candidate_models[-1] if candidate_models else None,
+        False,
+        first_request_id,
+    )
+
+
+def _safe_style_prompt_fragment(style_profile: str) -> str:
+    if style_profile == "ambient":
+        return "Use a muted palette with soft haze, color field gradients, and subtle texture."
+    if style_profile == "minimal":
+        return "Use a muted palette with minimal grain, soft gradients, and non-representational color fields."
+    if style_profile == "painterly":
+        return "Use a muted palette with paper texture, soft gradients, and minimal grain."
+    return "Use a muted palette with soft gradients, subtle texture, and minimal grain."
+
+
+def build_prompt_normal(style_profile: str) -> str:
+    suffix = _safe_style_prompt_fragment(style_profile)
+    return (
+        "Create a calm, abstract, non-representational background around a fixed central square artwork that must remain unchanged. "
+        "Generate only outside the central square. "
+        "Use minimal color field composition, soft gradients, and subtle texture. "
+        "No text, logos, watermarks, UI, borders, or frames. "
+        "No people or recognizable subjects. "
         f"{suffix}"
     )
+
+
+def build_prompt_ultra_minimal() -> str:
+    return "Abstract background only. Do not change the central square. No text."
 
 
 def _make_canvas_and_mask(
@@ -719,6 +770,7 @@ def generate_widescreen_artwork(
 
         temp_path = out_dir / f".{output_path.name}.part-{int(time.time() * 1000)}-{random.randint(1000, 9999)}"
         used_model_for_entry = ""
+        blocked_attempts: List[Dict[str, Any]] = []
         try:
             canvas, mask, geometry = _make_canvas_and_mask(
                 source_path=source_path,
@@ -726,7 +778,6 @@ def generate_widescreen_artwork(
                 edit_height=edit_h,
                 album_px=album_px_edit,
             )
-            prompt = _build_widescreen_prompt(style_profile)
             validate_mask_pair(canvas, mask)
             if canvas.size != mask.size:
                 raise RuntimeError(f"mask/image size mismatch {canvas.size} vs {mask.size}")
@@ -749,17 +800,69 @@ def generate_widescreen_artwork(
             canvas_png = _image_to_png_bytes(canvas)
             mask_png = _image_to_png_bytes(mask)
 
-            generated_bytes, api_error, used_model = _request_openai_image_edit(
-                canvas_png=canvas_png,
-                mask_png=mask_png,
-                prompt=prompt,
-                model=model,
-                seed=seed,
-                timeout_s=180,
-                size=openai_size,
-            )
-            used_model_for_entry = used_model or model
-            if api_error or not generated_bytes:
+            generated_bytes: Optional[bytes] = None
+            api_error: Optional[str] = None
+            prompt_attempts = [
+                ("normal", build_prompt_normal(style_profile)),
+                ("ultra_minimal", build_prompt_ultra_minimal()),
+            ]
+            for attempt_number, (prompt_variant, prompt_text) in enumerate(prompt_attempts, start=1):
+                generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
+                    canvas_png=canvas_png,
+                    mask_png=mask_png,
+                    prompt=prompt_text,
+                    model=model,
+                    seed=seed,
+                    timeout_s=180,
+                    size=openai_size,
+                )
+                if used_model:
+                    used_model_for_entry = used_model
+                elif not used_model_for_entry:
+                    used_model_for_entry = model
+
+                if generated_bytes:
+                    break
+
+                if moderation_blocked:
+                    blocked_attempt = {
+                        "text_key": text_key,
+                        "attempt": attempt_number,
+                        "prompt_variant": prompt_variant,
+                        "request_id": request_id,
+                    }
+                    blocked_attempts.append(blocked_attempt)
+                    print(
+                        f"Blocked: text_key={text_key} attempt={attempt_number} "
+                        f"prompt_variant={prompt_variant} request_id={request_id or 'n/a'}"
+                    )
+                    if attempt_number == 1:
+                        continue
+
+                    entries[text_key] = {
+                        "text_key": text_key,
+                        "collectionId": collection_id or "",
+                        "source_path": str(source_path),
+                        "output_path": str(output_path),
+                        "bytes": 0,
+                        "status": "blocked",
+                        "error_message": api_error or "moderation_blocked",
+                        "timestamp": _utc_now_iso(),
+                        "model_requested": model,
+                        "model_used": used_model_for_entry,
+                        "style_profile": style_profile,
+                        "edit_size": f"{edit_w}x{edit_h}",
+                        "final_size": f"{final_w}x{final_h}",
+                        "album_px_edit": album_px_edit,
+                        "album_px_final": album_px,
+                        "blocked_attempts": blocked_attempts,
+                    }
+                    err_count += 1
+                    raise ModerationBlockedError(api_error or "moderation_blocked")
+
+                raise RuntimeError(api_error or "image-edit returned empty output")
+
+            if not generated_bytes:
                 raise RuntimeError(api_error or "image-edit returned empty output")
 
             generated_edit = Image.open(io.BytesIO(generated_bytes)).convert("RGBA")
@@ -836,9 +939,12 @@ def generate_widescreen_artwork(
                 "album_px_edit": album_px_edit,
                 "album_px_final": album_px,
                 "geometry": geometry,
+                "blocked_attempts": blocked_attempts,
             }
             ok_count += 1
             generated_new_count += 1
+        except ModerationBlockedError:
+            continue
         except Exception as exc:
             if temp_path.exists():
                 temp_path.unlink(missing_ok=True)
@@ -858,6 +964,7 @@ def generate_widescreen_artwork(
                 "final_size": f"{final_w}x{final_h}",
                 "album_px_edit": album_px_edit,
                 "album_px_final": album_px,
+                "blocked_attempts": blocked_attempts,
             }
             err_count += 1
         finally:
