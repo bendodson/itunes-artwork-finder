@@ -190,8 +190,10 @@ Environment:
 - Optional endpoint override: `OPENAI_IMAGES_EDITS_URL` (must point to an Images edits endpoint compatible with GPT image models for masked edits).
 
 Outputs:
-- Widescreen files in `out/widescreen/` named `<text_key>__3840x2160.png`
+- Widescreen files in `out/widescreen/` named `<collectionId-or-contentId>__3840x2160.png`
+- If both IDs are missing, fallback naming is `unknown__<sha1(text_key)[:12]>__3840x2160.png`
 - Run manifest in `out/widescreen/manifest.json`
+- Optional lookup index in `out/widescreen/index.json`
 
 ## Polite API Usage
 
