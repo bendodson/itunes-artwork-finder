@@ -489,6 +489,7 @@ def _request_openai_image_edit_once(
     endpoint: str,
     api_key: str,
     multipart_mode: str,
+    debug_upload_keys: bool,
     upload_debug_summary: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str], bool, bool, str]:
     headers = {
@@ -506,25 +507,30 @@ def _request_openai_image_edit_once(
     if not _is_gpt_image_model(model):
         data["response_format"] = "b64_json"
 
-    files: List[Tuple[str, Tuple[str, BytesIO, str]]] = []
-    if multipart_mode == "ha":
-        files = [
-            ("image[]", ("input.png", BytesIO(canvas_png), "image/png")),
-            ("mask", ("mask.png", BytesIO(mask_png), "image/png")),
-        ]
-    elif multipart_mode == "standard":
-        files = [
-            ("image", ("input.png", BytesIO(canvas_png), "image/png")),
-            ("mask", ("mask.png", BytesIO(mask_png), "image/png")),
-        ]
-    elif multipart_mode == "both":
-        files = [
-            ("image[]", ("input.png", BytesIO(canvas_png), "image/png")),
-            ("image", ("input.png", BytesIO(canvas_png), "image/png")),
-            ("mask", ("mask.png", BytesIO(mask_png), "image/png")),
-        ]
-    else:
+    if multipart_mode not in {"ha", "std"}:
         raise ValueError(f"invalid multipart_mode: {multipart_mode}")
+
+    image_field = "image[]" if multipart_mode == "ha" else "image"
+    files: List[Tuple[str, Tuple[str, BytesIO, str]]] = [
+        (image_field, ("input.png", BytesIO(canvas_png), "image/png")),
+        ("mask", ("mask.png", BytesIO(mask_png), "image/png")),
+    ]
+    multipart_keys = [key for key, _ in files]
+    image_like_keys = [key for key in multipart_keys if key.startswith("image")]
+    if len(image_like_keys) != 1:
+        raise RuntimeError(f"invalid multipart image keys: {multipart_keys}")
+    if "mask" not in multipart_keys:
+        raise RuntimeError(f"missing multipart mask key: {multipart_keys}")
+    if multipart_mode == "ha" and "image" in multipart_keys:
+        raise RuntimeError(f"ha mode forbids 'image' key in files: {multipart_keys}")
+    if multipart_mode == "std" and "image[]" in multipart_keys:
+        raise RuntimeError(f"std mode forbids 'image[]' key in files: {multipart_keys}")
+    if "image" in data or "image[]" in data or "mask" in data:
+        raise RuntimeError("multipart keys must not appear in form data")
+
+    if debug_upload_keys:
+        multipart_keys_display = "[" + ",".join(f"'{key}'" for key in multipart_keys) + "]"
+        print(f"UPLOAD multipart keys: {multipart_keys_display}")
 
     try:
         response = requests.post(endpoint, headers=headers, data=data, files=files, timeout=timeout_s)
@@ -570,6 +576,7 @@ def _request_openai_image_edit(
     timeout_s: int,
     size: Optional[str],
     multipart_mode: str,
+    debug_upload_keys: bool,
     upload_debug_summary: Optional[str] = None,
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str], bool, str]:
     api_key = os.environ.get("OPENAI_API_KEY", "").strip()
@@ -600,6 +607,7 @@ def _request_openai_image_edit(
             endpoint=endpoint,
             api_key=api_key,
             multipart_mode=multipart_mode,
+            debug_upload_keys=debug_upload_keys,
             upload_debug_summary=upload_debug_summary,
         )
         if image_bytes:
@@ -1013,6 +1021,7 @@ def generate_widescreen_artwork(
                 timeout_s=180,
                 size=openai_size,
                 multipart_mode=multipart_mode,
+                debug_upload_keys=debug_upload_bytes,
                 upload_debug_summary=upload_debug_summary if debug_upload_bytes else None,
             )
             request_id_for_entry = request_id or request_id_for_entry
@@ -2672,7 +2681,7 @@ def build_parser() -> argparse.ArgumentParser:
     )
     widescreen_parser.add_argument(
         "--multipart-mode",
-        choices=("ha", "standard", "both"),
+        choices=("ha", "std"),
         default="ha",
         help="Multipart image key mode for /v1/images/edits compatibility",
     )
