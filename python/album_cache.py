@@ -39,6 +39,7 @@ try:
     from PIL import Image
     from PIL import ImageChops
     from PIL import ImageDraw
+    from PIL import ImageEnhance
     from PIL import ImageFilter
     from PIL import ImageOps
 
@@ -47,6 +48,7 @@ except Exception:
     Image = None
     ImageChops = None
     ImageDraw = None
+    ImageEnhance = None
     ImageFilter = None
     ImageOps = None
     PIL_AVAILABLE = False
@@ -351,6 +353,18 @@ def _write_widescreen_manifest_and_index(
             "entries": {key: index[key] for key in sorted(index.keys())},
         },
     )
+
+
+def _write_error_log(
+    path: Path,
+    errors: List[Dict[str, Any]],
+) -> None:
+    payload = {
+        "generatedAt": _utc_now_iso(),
+        "count": len(errors),
+        "errors": errors,
+    }
+    write_json_atomic(path, payload)
 
 
 def _resample_lanczos() -> Any:
@@ -918,6 +932,64 @@ def _composite_album_with_shadow(
     return Image.alpha_composite(base, album_layer).convert("RGB")
 
 
+def _render_local_fallback_background(
+    source_path: Path,
+    background_output_path: Path,
+    output_path: Path,
+    final_w: int,
+    final_h: int,
+    album_px: int,
+    album_shadow: bool,
+) -> Tuple[int, int]:
+    assert PIL_AVAILABLE and Image is not None and ImageDraw is not None and ImageFilter is not None
+    assert ImageOps is not None and ImageEnhance is not None
+
+    source_rgb = Image.open(source_path).convert("RGB")
+    background = ImageOps.fit(
+        source_rgb,
+        (final_w, final_h),
+        method=_resample_lanczos(),
+        centering=(0.5, 0.5),
+    )
+    background = background.filter(ImageFilter.GaussianBlur(radius=62))
+    background = ImageEnhance.Color(background).enhance(0.92)
+    background = ImageEnhance.Brightness(background).enhance(0.75)
+
+    vignette_mask = Image.new("L", (final_w, final_h), 0)
+    draw = ImageDraw.Draw(vignette_mask)
+    max_radius = int((final_w**2 + final_h**2) ** 0.5 / 2)
+    for radius in range(max_radius, 0, -20):
+        alpha = int(205 * (1 - radius / max_radius) ** 1.8)
+        draw.ellipse(
+            (
+                final_w // 2 - radius,
+                final_h // 2 - radius,
+                final_w // 2 + radius,
+                final_h // 2 + radius,
+            ),
+            fill=alpha,
+        )
+    background = Image.composite(background, Image.new("RGB", (final_w, final_h), (10, 10, 10)), vignette_mask)
+
+    ensure_out_dir(background_output_path.parent)
+    ensure_out_dir(output_path.parent)
+    background.save(background_output_path, format="PNG")
+
+    x = (final_w - album_px) // 2
+    y = (final_h - album_px) // 2
+    album_patch = _load_album_square(source_path, album_px)
+    final_image = _composite_album_with_shadow(
+        background_rgb=background,
+        album_patch_rgb=album_patch,
+        x=x,
+        y=y,
+        album_px=album_px,
+        enabled=album_shadow,
+    )
+    final_image.save(output_path, format="PNG")
+    return output_path.stat().st_size, background_output_path.stat().st_size
+
+
 def _find_source_art_path(
     source_art_dir: Path,
     source_manifest_entries: Dict[str, Dict[str, Any]],
@@ -962,6 +1034,8 @@ def generate_widescreen_artwork(
     multipart_mode: str,
     background_mode: str,
     compressed_max_bytes: int,
+    fallback_on_blocked: bool,
+    error_log_path: Optional[Path],
 ) -> None:
     if not PIL_AVAILABLE or Image is None or ImageChops is None or ImageDraw is None:
         raise RuntimeError("Pillow is required for generate-widescreen. Install: pip install pillow")
@@ -989,7 +1063,9 @@ def generate_widescreen_artwork(
     album_px_edit = HA_CENTER_SIZE
 
     manifest_path = out_dir / "manifest.json"
+    resolved_error_log_path = error_log_path if error_log_path is not None else (out_dir / "errors.json")
     entries: Dict[str, Dict[str, Any]] = {}
+    generation_errors: List[Dict[str, Any]] = []
     if manifest_path.exists():
         existing_manifest = load_json_dict(manifest_path)
         existing_entries = existing_manifest.get("entries")
@@ -1189,6 +1265,7 @@ def generate_widescreen_artwork(
             existing_entry["compressed_within_limit"] = compressed_ok
             entries[text_key] = existing_entry
             _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
+            _write_error_log(resolved_error_log_path, generation_errors)
             skip_count += 1
             print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
             if index < total and sleep_ms > 0:
@@ -1197,6 +1274,14 @@ def generate_widescreen_artwork(
 
         source_path = _find_source_art_path(source_art_dir, source_manifest_entries, text_key, content_id)
         if source_path is None:
+            missing_error = {
+                "text_key": text_key,
+                "collection_id": content_id or "",
+                "status": "missing_source_art",
+                "error_message": "source artwork not found",
+                "timestamp": _utc_now_iso(),
+            }
+            generation_errors.append(missing_error)
             entries[text_key] = _build_widescreen_entry(
                 text_key_value=text_key,
                 content_id_value=content_id,
@@ -1210,6 +1295,7 @@ def generate_widescreen_artwork(
                 request_id_value="",
             )
             _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
+            _write_error_log(resolved_error_log_path, generation_errors)
             err_count += 1
             print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
             if index < total and sleep_ms > 0:
@@ -1339,6 +1425,62 @@ def generate_widescreen_artwork(
                 used_model_for_entry = model
 
             if moderation_blocked:
+                if fallback_on_blocked:
+                    try:
+                        fallback_bytes, fallback_bg_bytes = _render_local_fallback_background(
+                            source_path=source_path,
+                            background_output_path=background_output_path,
+                            output_path=output_path,
+                            final_w=final_w,
+                            final_h=final_h,
+                            album_px=album_px,
+                            album_shadow=album_shadow,
+                        )
+                        geometry["final_width"] = final_w
+                        geometry["final_height"] = final_h
+                        geometry["album_px_final"] = album_px
+                        geometry["x0_final"] = (final_w - album_px) // 2
+                        geometry["y0_final"] = (final_h - album_px) // 2
+                        entries[text_key] = _build_widescreen_entry(
+                            text_key_value=text_key,
+                            content_id_value=content_id,
+                            source_art_path_value=str(source_path),
+                            output_path_value=output_path,
+                            bytes_value=fallback_bytes,
+                            status_value="ok",
+                            error_message_value="",
+                            model_used_value="local-fallback",
+                            prompt_variant_value="local_fallback_blurred_cover",
+                            request_id_value=request_id_for_entry,
+                            geometry_value=geometry,
+                            blocked_attempts_value=blocked_attempts,
+                        )
+                        entries[text_key]["fallback_reason"] = "moderation_blocked"
+                        entries[text_key]["background_output_path"] = str(background_output_path)
+                        entries[text_key]["background_bytes"] = fallback_bg_bytes
+                        compressed_ok, compressed_size = _compress_png_to_jpeg_max_bytes(
+                            output_path,
+                            compressed_output_path,
+                            compressed_max_bytes,
+                        )
+                        entries[text_key]["compressed_output_path"] = str(compressed_output_path)
+                        entries[text_key]["compressed_bytes"] = compressed_size
+                        entries[text_key]["compressed_max_bytes"] = compressed_max_bytes
+                        entries[text_key]["compressed_within_limit"] = compressed_ok
+                        ok_count += 1
+                        generated_new_count += 1
+                        continue
+                    except Exception as fallback_exc:
+                        generation_errors.append(
+                            {
+                                "text_key": text_key,
+                                "collection_id": content_id or "",
+                                "status": "fallback_failed",
+                                "error_message": str(fallback_exc),
+                                "request_id": request_id_for_entry,
+                                "timestamp": _utc_now_iso(),
+                            }
+                        )
                 blocked_attempt = {
                     "text_key": text_key,
                     "attempt": 1,
@@ -1362,6 +1504,16 @@ def generate_widescreen_artwork(
                     prompt_variant_value=prompt_variant_used,
                     request_id_value=request_id_for_entry,
                     blocked_attempts_value=blocked_attempts,
+                )
+                generation_errors.append(
+                    {
+                        "text_key": text_key,
+                        "collection_id": content_id or "",
+                        "status": "blocked",
+                        "error_message": api_error or "moderation_blocked",
+                        "request_id": request_id_for_entry,
+                        "timestamp": _utc_now_iso(),
+                    }
                 )
                 err_count += 1
                 raise ModerationBlockedError(api_error or "moderation_blocked")
@@ -1460,11 +1612,22 @@ def generate_widescreen_artwork(
                 request_id_value=request_id_for_entry,
                 blocked_attempts_value=blocked_attempts,
             )
+            generation_errors.append(
+                {
+                    "text_key": text_key,
+                    "collection_id": content_id or "",
+                    "status": "error",
+                    "error_message": str(exc),
+                    "request_id": request_id_for_entry,
+                    "timestamp": _utc_now_iso(),
+                }
+            )
             err_count += 1
         finally:
             if temp_path.exists():
                 temp_path.unlink(missing_ok=True)
             _write_widescreen_manifest_and_index(out_dir, manifest_path, entries)
+            _write_error_log(resolved_error_log_path, generation_errors)
             print(f"Widescreen {index}/{total} (ok: {ok_count}, skip: {skip_count}, err: {err_count})")
             if index < total and sleep_ms > 0:
                 _sleep_seconds(sleep_ms / 1000.0)
@@ -3060,6 +3223,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=JPEG_MAX_BYTES_DEFAULT,
         help="Maximum file size for compressed widescreen JPEG outputs",
     )
+    widescreen_parser.add_argument(
+        "--fallback-on-blocked",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="On moderation blocks, write a local blurred-cover fallback instead of failing (default true)",
+    )
+    widescreen_parser.add_argument(
+        "--error-log-path",
+        type=Path,
+        default=None,
+        help="Path for generation errors JSON (default: <out-dir>/errors.json)",
+    )
 
     return parser
 
@@ -3152,6 +3327,8 @@ def main() -> None:
             multipart_mode=args.multipart_mode,
             background_mode=args.background_mode,
             compressed_max_bytes=args.compressed_max_bytes,
+            fallback_on_blocked=args.fallback_on_blocked,
+            error_log_path=args.error_log_path,
         )
         return
 
