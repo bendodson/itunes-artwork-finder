@@ -1095,10 +1095,12 @@ def generate_widescreen_artwork(
                 canvas.save(debug_last_canvas_path, format="PNG")
                 if background_mode == "ha-masked-outpaint":
                     mask.save(debug_last_mask_path, format="PNG")
-                print(
-                    f"Debug canvas/mask saved: {debug_last_canvas_path} ({canvas.size}), "
-                    f"{debug_last_mask_path} ({mask.size})"
-                )
+                    print(
+                        f"Debug canvas/mask saved: {debug_last_canvas_path} ({canvas.size}), "
+                        f"{debug_last_mask_path} ({mask.size})"
+                    )
+                else:
+                    print(f"Debug canvas saved: {debug_last_canvas_path} ({canvas.size})")
 
             if canvas.size != (edit_w, edit_h):
                 raise RuntimeError(
