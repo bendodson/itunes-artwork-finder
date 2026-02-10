@@ -2696,8 +2696,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     widescreen_parser.add_argument(
         "--preserve-album",
-        action="store_true",
-        help="Paste the original square album art back into the exact center of the final output",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Paste the original square album art back into the exact center of the final output (default true)",
     )
 
     return parser
