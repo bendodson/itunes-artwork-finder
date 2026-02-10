@@ -67,16 +67,19 @@ OPENAI_IMAGES_EDITS_ENDPOINT = "https://api.openai.com/v1/images/edits"
 OPENAI_GPT_IMAGE_SIZES = {"auto", "1024x1024", "1536x1024", "1024x1536"}
 EDIT_WIDTH_DEFAULT = 1536
 EDIT_HEIGHT_DEFAULT = 1024
-PHASE4_OUTPAINT_PROMPT = (
-    "Extend the central square artwork outward seamlessly into a full-bleed 16:9 image. "
-    "Treat the central square as a window: continue the same world, materials, tones, and textures "
-    "beyond the square edges so it feels like the image simply expands. "
-    "Match the exact palette, grain/texture, lighting, and era of the central square. "
-    "Do not introduce any new distinct subjects, scenes, or styles; do not invent unrelated environments. "
-    "No text, typography, logos, watermarks, UI, borders, frames, or mats."
-)
-PHASE4_OUTPAINT_TEXT_REMOVAL = (
-    "Remove any text in the entire image and reconstruct those areas to match the existing artwork."
+FRAME_FINAL_WIDTH = 3840
+FRAME_FINAL_HEIGHT = 2160
+HA_EDIT_WIDTH = 1536
+HA_EDIT_HEIGHT = 1024
+HA_CENTER_SIZE = 1024
+HA_PASTE_X = 256
+HA_PASTE_Y = 0
+HA_EDIT_SIZE = f"{HA_EDIT_WIDTH}x{HA_EDIT_HEIGHT}"
+HA_OUTPAINT_PROMPT = (
+    "Remove ALL text, typography, logos, label marks, and signatures from the entire image. "
+    "Do not add any new text. Reconstruct removed areas as coherent artwork matching the existing style. "
+    "Then outpaint the image into seamless full-bleed 16:9 by extending naturally beyond the left/right edges. "
+    "No borders, no mat, no frames, no captions."
 )
 
 
@@ -360,8 +363,6 @@ def _image_to_png_bytes(image: Any) -> bytes:
 def validate_mask_pair(image: Any, mask: Any) -> None:
     if image.size != mask.size:
         raise RuntimeError(f"mask/image size mismatch {image.size} vs {mask.size}")
-    if mask.mode != "RGBA":
-        raise RuntimeError(f"mask must be RGBA for image edits, got {mask.mode}")
 
 
 def _parse_b64_image_from_edits_payload(payload: Dict[str, Any]) -> Optional[bytes]:
@@ -588,21 +589,6 @@ def _request_openai_image_edit(
     )
 
 
-def build_prompt_normal(style_profile: str) -> str:
-    return (
-        "Remove all text, typography, logos, label marks, and signatures from the entire image; "
-        "do not add any new text. Reconstruct removed areas to match the existing artwork style. "
-        "Then outpaint seamlessly to a full-bleed 16:9 image by extending naturally into the surrounding space. "
-        "No borders, mats, frames, captions, UI, or watermarks."
-    )
-
-
-def build_outpaint_prompt(remove_text: bool = True) -> str:
-    if not remove_text:
-        return PHASE4_OUTPAINT_PROMPT
-    return f"{PHASE4_OUTPAINT_PROMPT} {PHASE4_OUTPAINT_TEXT_REMOVAL}"
-
-
 def _load_album_square(source_path: Path, album_px: int) -> Any:
     assert PIL_AVAILABLE and Image is not None
     with Image.open(source_path) as source_image:
@@ -610,36 +596,34 @@ def _load_album_square(source_path: Path, album_px: int) -> Any:
     return album_rgb.resize((album_px, album_px), _resample_lanczos())
 
 
-def _make_canvas_and_mask(
-    source_path: Path,
-    edit_width: int,
-    edit_height: int,
-    album_px: int,
-) -> Tuple[Any, Any, Dict[str, int]]:
+def build_ha_outpaint_canvas_and_mask(src_album_path: str) -> tuple[Image.Image, Image.Image]:
     assert PIL_AVAILABLE and Image is not None
+    with Image.open(src_album_path) as source_image:
+        source_rgb = source_image.convert("RGB")
+    cover = source_rgb.resize((HA_CENTER_SIZE, HA_CENTER_SIZE), _resample_lanczos())
+    canvas = Image.new("RGB", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), (0, 0, 0))
+    canvas.paste(cover, (HA_PASTE_X, HA_PASTE_Y))
+    mask = Image.new("L", (HA_EDIT_WIDTH, HA_EDIT_HEIGHT), 255)
+    return canvas, mask
 
-    resized = _load_album_square(source_path, album_px)
 
-    x0 = (edit_width - album_px) // 2
-    y0 = (edit_height - album_px) // 2
-
-    canvas = Image.new("RGBA", (edit_width, edit_height), (0, 0, 0, 0))
-    canvas.paste(resized, (x0, y0))
-
-    # OpenAI image editing uses transparency-based masks:
-    # alpha=0 editable, alpha=255 protected.
-    mask = Image.new("RGBA", (edit_width, edit_height), (255, 255, 255, 0))
-
-    geometry = {
-        "edit_width": edit_width,
-        "edit_height": edit_height,
-        "album_px": album_px,
-        "x0": x0,
-        "y0": y0,
-        "resized_width": resized.width,
-        "resized_height": resized.height,
-    }
-    return canvas, mask, geometry
+def ha_edit_to_frame(
+    img_edit: Image.Image,
+    final_w: int = FRAME_FINAL_WIDTH,
+    final_h: int = FRAME_FINAL_HEIGHT,
+) -> Image.Image:
+    assert PIL_AVAILABLE and Image is not None
+    if img_edit.size != (HA_EDIT_WIDTH, HA_EDIT_HEIGHT):
+        raise RuntimeError(
+            f"invalid output size {img_edit.width}x{img_edit.height}; expected {HA_EDIT_WIDTH}x{HA_EDIT_HEIGHT}"
+        )
+    scale = final_w / HA_EDIT_WIDTH
+    scaled_h = round(HA_EDIT_HEIGHT * scale)
+    img_scaled = img_edit.resize((final_w, scaled_h), _resample_lanczos())
+    if scaled_h < final_h:
+        raise RuntimeError(f"scaled height too small for centered crop: {scaled_h} < {final_h}")
+    crop_y = (scaled_h - final_h) // 2
+    return img_scaled.crop((0, crop_y, final_w, crop_y + final_h))
 
 
 def _pixel_identical_region(lhs: Any, rhs: Any, x: int, y: int, w: int, h: int) -> bool:
@@ -692,6 +676,7 @@ def generate_widescreen_artwork(
     seed: Optional[int],
     debug_save_canvas: bool,
     limit: Optional[int],
+    preserve_album: bool,
 ) -> None:
     if not PIL_AVAILABLE or Image is None or ImageChops is None or ImageDraw is None:
         raise RuntimeError("Pillow is required for generate-widescreen. Install: pip install pillow")
@@ -704,12 +689,15 @@ def generate_widescreen_artwork(
         raise ValueError("limit must be >= 0")
 
     ensure_out_dir(out_dir)
-    final_w = target_width
-    final_h = target_height
-    edit_w = EDIT_WIDTH_DEFAULT
-    edit_h = EDIT_HEIGHT_DEFAULT
-    album_px_edit = round(album_px * (edit_w / final_w))
-    album_px_edit = max(256, min(album_px_edit, min(edit_w, edit_h) - 64))
+    final_w = FRAME_FINAL_WIDTH
+    final_h = FRAME_FINAL_HEIGHT
+    edit_w = HA_EDIT_WIDTH
+    edit_h = HA_EDIT_HEIGHT
+    if target_width != final_w or target_height != final_h:
+        raise ValueError(
+            f"generate-widescreen currently requires target {final_w}x{final_h} for Frame TV centering"
+        )
+    album_px_edit = HA_CENTER_SIZE
 
     manifest_path = out_dir / "manifest.json"
     entries: Dict[str, Dict[str, Any]] = {}
@@ -745,7 +733,7 @@ def generate_widescreen_artwork(
     skip_count = 0
     err_count = 0
     generated_new_count = 0
-    openai_size = _derive_openai_size(target_width=edit_w, target_height=edit_h)
+    openai_size = HA_EDIT_SIZE
 
     def _build_widescreen_entry(
         *,
@@ -783,6 +771,9 @@ def generate_widescreen_artwork(
             "final_size": f"{final_w}x{final_h}",
             "album_px_edit": album_px_edit,
             "album_px_final": album_px,
+            "pipeline": "ha_outpaint",
+            "postprocess": "scale_to_width_center_crop",
+            "preserve_album": preserve_album,
         }
         if geometry_value is not None:
             entry["geometry"] = geometry_value
@@ -852,8 +843,8 @@ def generate_widescreen_artwork(
                     "final_height": final_h,
                     "album_px_edit": album_px_edit,
                     "album_px_final": album_px,
-                    "x0_edit": (edit_w - album_px_edit) // 2,
-                    "y0_edit": (edit_h - album_px_edit) // 2,
+                    "x0_edit": HA_PASTE_X,
+                    "y0_edit": HA_PASTE_Y,
                     "x0_final": (final_w - album_px) // 2,
                     "y0_final": (final_h - album_px) // 2,
                 },
@@ -893,16 +884,21 @@ def generate_widescreen_artwork(
         prompt_variant_used = ""
         request_id_for_entry = ""
         try:
-            canvas, mask, geometry = _make_canvas_and_mask(
-                source_path=source_path,
-                edit_width=edit_w,
-                edit_height=edit_h,
-                album_px=album_px_edit,
-            )
+            canvas, mask = build_ha_outpaint_canvas_and_mask(str(source_path))
             validate_mask_pair(canvas, mask)
             if canvas.size != mask.size:
                 raise RuntimeError(f"mask/image size mismatch {canvas.size} vs {mask.size}")
             assert canvas.size == mask.size, f"mask/image size mismatch {canvas.size} vs {mask.size}"
+            geometry = {
+                "edit_width": edit_w,
+                "edit_height": edit_h,
+                "final_width": final_w,
+                "final_height": final_h,
+                "album_px_edit": HA_CENTER_SIZE,
+                "album_px_final": album_px,
+                "x0_edit": HA_PASTE_X,
+                "y0_edit": HA_PASTE_Y,
+            }
 
             if debug_save_canvas:
                 debug_canvas = canvas.copy()
@@ -916,11 +912,11 @@ def generate_widescreen_artwork(
 
             generated_bytes: Optional[bytes] = None
             api_error: Optional[str] = None
-            prompt_variant_used = "outpaint"
+            prompt_variant_used = "ha_outpaint"
             generated_bytes, api_error, used_model, moderation_blocked, request_id = _request_openai_image_edit(
                 canvas_png=canvas_png,
                 mask_png=mask_png,
-                prompt=build_outpaint_prompt(remove_text=True),
+                prompt=HA_OUTPAINT_PROMPT,
                 model=model,
                 seed=seed,
                 timeout_s=180,
@@ -969,14 +965,12 @@ def generate_widescreen_artwork(
                     f"invalid output size {generated_edit.width}x{generated_edit.height}; expected {edit_w}x{edit_h}"
                 )
 
-            generated_final = generated_edit.resize((final_w, final_h), _resample_lanczos()).convert("RGB")
-
+            generated_final = ha_edit_to_frame(generated_edit, final_w=final_w, final_h=final_h).convert("RGB")
             fx = (final_w - album_px) // 2
             fy = (final_h - album_px) // 2
-            expected_album_patch_final = _load_album_square(source_path, album_px)
-            if not _replace_and_verify_album_region(generated_final, expected_album_patch_final, fx, fy, album_px):
-                if not _replace_and_verify_album_region(generated_final, expected_album_patch_final, fx, fy, album_px):
-                    raise RuntimeError("album artwork region changed after final restore")
+            if preserve_album:
+                expected_album_patch_final = _load_album_square(source_path, album_px)
+                generated_final.paste(expected_album_patch_final, (fx, fy))
 
             generated_final.save(temp_path, format="PNG")
             temp_path.replace(output_path)
@@ -2578,6 +2572,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Save debug canvas + mask with a center crosshair",
     )
+    widescreen_parser.add_argument(
+        "--preserve-album",
+        action="store_true",
+        help="Paste the original square album art back into the exact center of the final output",
+    )
 
     return parser
 
@@ -2661,6 +2660,7 @@ def main() -> None:
             seed=args.seed,
             debug_save_canvas=args.debug_save_canvas,
             limit=args.limit,
+            preserve_album=args.preserve_album,
         )
         return
 
