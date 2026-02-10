@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+import hashlib
 import io
 import json
 import os
@@ -209,6 +210,28 @@ def safe_filename(text_key: str, collection_id: Optional[int], limit: int = 120)
     return f"{normalized}__{cid}"
 
 
+def _resolve_widescreen_content_id(record: Dict[str, Any]) -> Optional[int]:
+    collection_id = _safe_int(record.get("collectionId"))
+    if collection_id is not None:
+        return collection_id
+    return _safe_int(record.get("contentId"))
+
+
+def _widescreen_output_stem(content_id: Optional[int], text_key: str) -> str:
+    if content_id is not None:
+        return str(content_id)
+    text_hash = hashlib.sha1((text_key or "").encode("utf-8")).hexdigest()[:12]
+    return f"unknown__{text_hash}"
+
+
+def _widescreen_output_name(content_id: Optional[int], text_key: str, width: int, height: int) -> str:
+    return f"{_widescreen_output_stem(content_id, text_key)}__{width}x{height}.png"
+
+
+def _legacy_widescreen_output_name(text_key: str, width: int, height: int) -> str:
+    return f"{text_key}__{width}x{height}.png"
+
+
 def _extension_from_url(url: str) -> str:
     suffix = Path(urlparse(url).path).suffix.lower()
     if suffix in {".jpg", ".jpeg", ".png", ".webp"}:
@@ -267,6 +290,37 @@ def _write_manifest(path: Path, entries: Dict[str, Dict[str, Any]]) -> None:
         "entries": ordered,
     }
     write_json_atomic(path, payload)
+
+
+def _write_widescreen_manifest_and_index(
+    out_dir: Path,
+    manifest_path: Path,
+    entries: Dict[str, Dict[str, Any]],
+) -> None:
+    _write_manifest(manifest_path, entries)
+    index_path = out_dir / "index.json"
+    index: Dict[str, Dict[str, Any]] = {}
+    for text_key, entry in entries.items():
+        if not isinstance(entry, dict):
+            continue
+        collection_id = entry.get("collection_id")
+        if collection_id in ("", None):
+            continue
+        collection_key = str(collection_id)
+        index[collection_key] = {
+            "text_key": text_key,
+            "output_path": entry.get("output_path", ""),
+            "status": entry.get("status", ""),
+            "prompt_variant": entry.get("prompt_variant", ""),
+            "request_id": entry.get("request_id", ""),
+        }
+    write_json_atomic(
+        index_path,
+        {
+            "generatedAt": _utc_now_iso(),
+            "entries": {key: index[key] for key in sorted(index.keys())},
+        },
+    )
 
 
 def _resample_lanczos() -> Any:
